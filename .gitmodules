@@ -1,3 +1,12 @@
 [submodule "third_part/OmniShotCut"]
 	path = third_part/OmniShotCut
 	url = https://github.com/UVA-Computer-Vision-Lab/OmniShotCut.git
+[submodule "third_part/sam3"]
+	path = third_part/sam3
+	url = https://github.com/facebookresearch/sam3.git
+[submodule "third_part/VQA2"]
+	path = third_part/VQA2
+	url = https://github.com/Q-Future/Visual-Question-Answering-for-Video-Quality-Assessment.git
+[submodule "third_part/memfof"]
+	path = third_part/memfof
+	url = https://github.com/msu-video-group/memfof.git
