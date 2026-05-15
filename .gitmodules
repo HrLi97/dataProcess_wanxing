@@ -1,0 +1,3 @@
+[submodule "third_part/OmniShotCut"]
+	path = third_part/OmniShotCut
+	url = https://github.com/UVA-Computer-Vision-Lab/OmniShotCut.git
