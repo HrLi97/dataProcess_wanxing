@@ -10,3 +10,12 @@
 [submodule "third_part/memfof"]
 	path = third_part/memfof
 	url = https://github.com/msu-video-group/memfof.git
+[submodule "/mnt/workspace/lihaoran/data_process/third_part/HoloCine"]
+	path = /mnt/workspace/lihaoran/data_process/third_part/HoloCine
+	url = https://github.com/yihao-meng/HoloCine.git
+[submodule "third_part/TalkNCE"]
+	path = third_part/TalkNCE
+	url = https://github.com/kaistmm/TalkNCE
+[submodule "third_part/Synchformer"]
+	path = third_part/Synchformer
+	url = https://github.com/v-iashin/Synchformer.git
