@@ -3,3 +3,11 @@
 ./meta_data/
 ./test_data/
 ./data_process_v3.5/
+./docs/
+./.vscode/
+
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.so
