@@ -19,3 +19,12 @@
 [submodule "third_part/Synchformer"]
 	path = third_part/Synchformer
 	url = https://github.com/v-iashin/Synchformer.git
+[submodule "third_part/pyannote-audio"]
+	path = third_part/pyannote-audio
+	url = https://github.com/pyannote/pyannote-audio.git
+[submodule "third_part/LR-ASD"]
+	path = third_part/LR-ASD
+	url = https://github.com/Junhua-Liao/LR-ASD.git
+[submodule "third_part/ImageBind"]
+	path = third_part/ImageBind
+	url = https://github.com/facebookresearch/ImageBind.git
