@@ -1,0 +1,10 @@
+# DOVER 推理所需依赖（已精简，移除训练/可视化/ONNX 相关包）
+torch>=1.13
+torchvision
+opencv-python
+decord
+numpy
+tqdm
+timm
+einops
+scikit-video
