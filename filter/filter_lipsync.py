@@ -114,7 +114,6 @@ def process_segment(
 
     # ── Step 1: PyAnnote Diarization (uses enhanced audio if available) ───────
     diarization = {"status": "disabled", "speakers": []}
-    # If enhanced audio is available, use it for better diarization
     diarize_input = enhanced_audio_path if enhanced_audio_path else processing_video_path
     diarization = pyannote_worker.diarize(diarize_input)
 
@@ -133,6 +132,7 @@ def process_segment(
         and len(diarization.get("speakers", [])) > 0
     )
 
+    print(use_multi_speaker,"use_multi_speaker")
 
     num_speakers = 0
     if use_multi_speaker:
@@ -162,6 +162,7 @@ def process_segment(
 
         score_matrix: dict[int, list] = {tr["track_id"]: [] for tr in face_tracks}
 
+        # 对每个 face track，在每个 speaker 时间窗口内裁剪人脸 + 提取音频，调用 SyncNet 得到 confidence 分数
         for tr in face_tracks:
             tr_id = tr["track_id"]
             for seg in speaker_segments:
@@ -176,9 +177,13 @@ def process_segment(
                 )
 
                 sync_mean = None
+                sync_offset = None
+                sync_is_speaking = False
                 if sync_res.get("status") == "ok":
                     for t in sync_res.get("tracks", []):
                         sync_mean = t.get("mean_score")
+                        sync_offset = t.get("offset")
+                        sync_is_speaking = t.get("is_speaking", False)
                         break
 
                 score_matrix[tr_id].append({
@@ -186,36 +191,49 @@ def process_segment(
                     "spk_start": spk_start,
                     "spk_end": spk_end,
                     "sync_mean": sync_mean,
+                    "sync_offset": sync_offset,
+                    "sync_is_speaking": sync_is_speaking,
                     "sync_status": sync_res.get("status", "unknown"),
                 })
 
-        # Per-track: pick the best speaker window by SyncNet score
+        # 对每个 face track，优先选 is_speaking=True 且 confidence 最高的 window；
+        # 若无 is_speaking=True 的，退而选 confidence 最高的（但标记为未通过）
         track_best = {}
         for tr in face_tracks:
             tr_id = tr["track_id"]
             entries = [e for e in score_matrix[tr_id] if e["sync_status"] == "ok" and e["sync_mean"] is not None]
             if not entries:
                 track_best[tr_id] = {"spk_id": None, "spk_start": None, "spk_end": None,
-                                     "sync_mean": None, "sync_status": "no_valid_window"}
+                                     "sync_mean": None, "sync_offset": None,
+                                     "sync_is_speaking": False, "sync_status": "no_valid_window"}
             else:
-                best = max(entries, key=lambda e: e["sync_mean"])
+                # 优先选 is_speaking=True（offset 在 [-6,6] 且 confidence>=1）的
+                speaking_entries = [e for e in entries if e["sync_is_speaking"]]
+                if speaking_entries:
+                    best = max(speaking_entries, key=lambda e: e["sync_mean"])
+                else:
+                    best = max(entries, key=lambda e: e["sync_mean"])
                 track_best[tr_id] = best
 
 
-        # Select primary face track (highest SyncNet confidence)
-        valid = [(tr_id, info) for tr_id, info in track_best.items()
-                 if info["sync_mean"] is not None]
-        if valid:
-            primary_tr_id, primary_info = max(valid, key=lambda x: x[1]["sync_mean"])
+        # 从所有 track 的 best 中选 primary：优先 is_speaking=True，再按 confidence
+        speaking = [(tr_id, info) for tr_id, info in track_best.items()
+                    if info.get("sync_is_speaking")]
+        non_speaking = [(tr_id, info) for tr_id, info in track_best.items()
+                        if info["sync_mean"] is not None and not info.get("sync_is_speaking")]
+        if speaking:
+            primary_tr_id, primary_info = max(speaking, key=lambda x: x[1]["sync_mean"])
+        elif non_speaking:
+            primary_tr_id, primary_info = max(non_speaking, key=lambda x: x[1]["sync_mean"])
         else:
             primary_tr_id, primary_info = None, None
 
         primary_tr = next((t for t in face_tracks if t["track_id"] == primary_tr_id), None)
 
-        # ── Semantic sync evaluation (multi-speaker path) ─────────────────────
+        # ── 语义同步（必经流程） ─────────────────────────────────────────────
         semantic_score = None
         semantic_status = "skipped"
-        sem_result = {"is_semantically_synced": True}
+        sem_result = {"is_semantically_synced": False}
         if semantic_sync_worker is not None:
             sem_result = semantic_sync_worker.score(
                 processing_video_path, enhanced_audio_path
@@ -224,59 +242,42 @@ def process_segment(
             semantic_status = sem_result.get("status", "unknown")
             print(f"  [SemanticSync] score={semantic_score}, status={semantic_status}")
 
-        threshold = getattr(args, "syncnet_min_confidence", 1.0)
-        if primary_info and primary_info["sync_mean"] >= threshold:
-            # Check semantic sync gate
-            reject_reasons = []
-            if (
-                semantic_status == "ok"
-                and semantic_score is not None
-                and not sem_result.get("is_semantically_synced", True)
-            ):
+        semantic_passed = sem_result.get("is_semantically_synced", False)
+
+        # ── 判定逻辑 ──────────────────────────────────────────────────────────
+        # 有 speaking face 存在 → 必须选它，同时语义同步也必须通过
+        # 没有 speaking face → 退化到语义同步兜底判断
+        has_speaking = primary_info and primary_info.get("sync_is_speaking")
+
+        reject_reasons = []
+        if has_speaking:
+            # 有说话人：语义同步必须通过
+            if not semantic_passed:
+                reject_reasons.append("semantic_not_synced")
+        else:
+            # 无说话人：语义同步兜底
+            reject_reasons.append("target_not_speaking")
+            if not semantic_passed:
                 reject_reasons.append("semantic_not_synced")
 
-            is_qual = len(reject_reasons) == 0
+        is_qual = len(reject_reasons) == 0
 
-            qualified_video_path = ""
-            if is_qual:
-                out_name = f"{safe_name(Path(processing_video_path).stem)}.mp4"
-                qualified_video_path = link_or_copy(
-                    processing_video_path,
-                    Path(qualified_dir) / out_name,
-                    args.qualified_copy_mode,
-                )
-
-            talknce_spoke = False
-            if talknce_result.get("status") == "ok":
-                for t in talknce_result.get("tracks", []):
-                    if t["track_id"] == primary_tr_id and t.get("is_active_speaker"):
-                        talknce_spoke = True
-                        break
-
-            return _make_row(
-                video_item, scene, segment_path,
-                qualified_dir, args,
-                qualified_video_path=qualified_video_path,
-                is_qualified=is_qual,
-                reject_reason=",".join(reject_reasons),
+        qualified_video_path = ""
+        if is_qual:
+            out_name = f"{safe_name(Path(processing_video_path).stem)}.mp4"
+            qualified_video_path = link_or_copy(
+                processing_video_path,
+                Path(qualified_dir) / out_name,
+                args.qualified_copy_mode,
             )
 
-        else:
-            # No face track passed SyncNet threshold (or track_best is empty)
-            best_mean = primary_info["sync_mean"] if primary_info else None
-            reject = ["target_not_speaking"]
-            if best_mean is None and primary_info is not None:
-                reject.append(primary_info["sync_status"])
-            elif primary_info is None:
-                reject.append("no_valid_track")
-
-            return _make_row(
-                video_item, scene, segment_path,
-                qualified_dir, args,
-                qualified_video_path="",
-                is_qualified=False,
-                reject_reason=",".join(reject),
-            )
+        return _make_row(
+            video_item, scene, segment_path,
+            qualified_dir, args,
+            qualified_video_path=qualified_video_path,
+            is_qualified=is_qual,
+            reject_reason=",".join(reject_reasons),
+        )
 
     # ── Single-speaker evaluation path ───────────────────────────────────────
     from filter.model_runner.insightface_runner import compact_tracks
@@ -303,10 +304,10 @@ def process_segment(
         (t for t in face_compact["tracks"] if t["track_id"] == primary_id), None
     )
 
-    # ── Semantic sync evaluation (single-speaker path) ────────────────────────
+    # ── 语义同步（必经流程） ────────────────────────────────────────────────
     semantic_score = None
     semantic_status = "skipped"
-    sem_result = {"is_semantically_synced": True}
+    sem_result = {"is_semantically_synced": False}
     if semantic_sync_worker is not None:
         sem_result = semantic_sync_worker.score(
             processing_video_path, enhanced_audio_path
@@ -315,18 +316,27 @@ def process_segment(
         semantic_status = sem_result.get("status", "unknown")
         print(f"  [SemanticSync] score={semantic_score}, status={semantic_status}")
 
-    # SyncNet is the primary gate: require both face + speaking + semantic sync
+    semantic_passed = sem_result.get("is_semantically_synced", False)
+
+    # 判定：有说话人 → 必须选 + 语义必须通过；无说话人 → 语义兜底
     reasons = []
-    if face_result.get("num_face_tracks", 0) == 0:
+    has_face = face_result.get("num_face_tracks", 0) > 0
+    if not has_face:
         reasons.append("no_face")
-    if syncnet_status == "ok" and not syncnet_spoke:
+
+    if has_face and syncnet_spoke:
+        # 有说话人：语义同步必须通过
+        if not semantic_passed:
+            reasons.append("semantic_not_synced")
+    elif has_face and not syncnet_spoke:
+        # 有脸但没在说话：语义兜底
         reasons.append("target_not_speaking")
-    if (
-        semantic_status == "ok"
-        and semantic_score is not None
-        and not sem_result.get("is_semantically_synced", True)
-    ):
-        reasons.append("semantic_not_synced")
+        if not semantic_passed:
+            reasons.append("semantic_not_synced")
+    else:
+        # 无脸：语义兜底
+        if not semantic_passed:
+            reasons.append("semantic_not_synced")
 
     is_qualified = len(reasons) == 0
 
@@ -594,7 +604,7 @@ def parse_args():
     )
     parser.add_argument(
         "--output_dir",
-        default="/mnt/workspace/lihaoran/data_process/test/result/0611/filter_lipsync/1",
+        default="/mnt/workspace/lihaoran/data_process/test/result/0612/filter_lipsync/1",
     )
     parser.add_argument("--device", default="cuda:0")
 
@@ -716,7 +726,7 @@ def parse_args():
         help="ImageBind 语义相似度阈值（cosine similarity > threshold = 语义同步）",
     )
     parser.add_argument(
-        "--semantic_sync_max_frames", type=int, default=5,
+        "--semantic_sync_max_frames", type=int, default=15,
         help="ImageBind 取样视频帧数（用于计算视觉 embedding）",
     )
 

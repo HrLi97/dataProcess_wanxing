@@ -1,9 +1,10 @@
 """
 使用 RAFT 光流进行视频动态质量筛选（自包含，无需导入 RAFT 包）
 """
-import os
-import shutil
 import argparse
+import csv
+import fcntl
+import shutil
 from pathlib import Path
 
 import cv2
@@ -606,6 +607,8 @@ class RAFT(nn.Module):
         return flow_predictions
 
 
+# ─── RAFT 加载 ────────────────────────────────────────────────────────────────
+
 def load_raft_model(model_path, small=False):
     """加载 RAFT 模型"""
     args = argparse.Namespace(
@@ -633,28 +636,24 @@ def compute_flow_magnitude(model, frame1, frame2, iters=20):
     """计算两帧之间的光流幅度均值"""
     image1 = frame_to_tensor(frame1)
     image2 = frame_to_tensor(frame2)
-
     padder = InputPadder(image1.shape)
     image1, image2 = padder.pad(image1, image2)
-
     _, flow_up = model(image1, image2, iters=iters, test_mode=True)
     flow = padder.unpad(flow_up[0]).cpu().numpy()  # (2, H, W)
-
-    # 计算光流幅度
     mag = np.sqrt(flow[0] ** 2 + flow[1] ** 2)
     return float(np.mean(mag))
 
 
-def compute_motion_score_raft(model, video_path, sampling_fps=2, iters=20, max_size=512):
+def compute_motion_score(model, video_path, sampling_fps=2, iters=20, max_size=512):
     """
     使用 RAFT 光流计算视频运动分数。
 
-    Args:
-        model: RAFT 模型
-        video_path: 视频路径
-        sampling_fps: 采样帧率
-        iters: RAFT 迭代次数（越多越精确，越慢）
-        max_size: 输入最大边长（降低分辨率加速推理）
+    运动分数参考（RAFT 光流，像素位移均值）：
+        - < 0.5:  几乎静止
+        - 0.5 ~ 2.0: 低动态（talking head、慢移动）
+        - 2.0 ~ 6.0: 中等动态（正常视频）
+        - 6.0 ~ 15.0: 高动态（运动场景、快速镜头）
+        - > 15.0: 极高动态（剧烈抖动、场景频繁切换）
 
     Returns:
         dict: {"motion_score": float, "frame_scores": list} 或 None
@@ -673,9 +672,7 @@ def compute_motion_score_raft(model, video_path, sampling_fps=2, iters=20, max_s
         cap.release()
         return None
 
-    valid_fps = min(max(sampling_fps, 1), fps)
-    frame_interval = max(1, int(fps / valid_fps))
-
+    frame_interval = max(1, int(fps / min(max(sampling_fps, 1), fps)))
     frame_scores = []
     prev_frame = None
     frame_count = -1
@@ -683,14 +680,11 @@ def compute_motion_score_raft(model, video_path, sampling_fps=2, iters=20, max_s
     while cap.isOpened():
         ret, frame = cap.read()
         frame_count += 1
-
         if not ret:
             break
-
         if frame_count % frame_interval != 0:
             continue
 
-        # 降低分辨率加速
         h, w = frame.shape[:2]
         if max(h, w) > max_size:
             scale = max_size / max(h, w)
@@ -709,7 +703,6 @@ def compute_motion_score_raft(model, video_path, sampling_fps=2, iters=20, max_s
         prev_frame = frame
 
     cap.release()
-
     if not frame_scores:
         return None
 
@@ -719,122 +712,153 @@ def compute_motion_score_raft(model, video_path, sampling_fps=2, iters=20, max_s
     }
 
 
-def filter_by_motion_raft(
-    input_dir,
-    model,
-    output_dir=None,
-    min_motion_score=1.0,
-    max_motion_score=50.0,
-    sampling_fps=2,
-    iters=20,
-    max_size=512,
-    extensions=(".mp4", ".avi", ".mkv", ".mov", ".flv", ".wmv", ".webm"),
-    copy_mode=True,
-):
-    """
-    使用 RAFT 光流进行视频动态性筛选。
+# ─── CSV Pipeline ────────────────────────────────────────────────────────────
 
-    运动分数参考（RAFT 光流，像素位移均值）：
-        - < 0.5:  几乎静止
-        - 0.5 ~ 2.0: 低动态（talking head、慢移动）
-        - 2.0 ~ 6.0: 中等动态（正常视频）
-        - 6.0 ~ 15.0: 高动态（运动场景、快速镜头）
-        - > 15.0: 极高动态（剧烈抖动、场景频繁切换）
+MOTION_FIELDS = ["motion_reject_reason", "motion_score"]
 
-    Args:
-        input_dir: 输入视频目录
-        model: RAFT 模型
-        output_dir: 输出目录（None 则只打印不复制）
-        min_motion_score: 最小运动分数阈值
-        max_motion_score: 最大运动分数阈值
-        sampling_fps: 采样帧率
-        iters: RAFT 迭代次数
-        max_size: 推理时图像最大边长
-        extensions: 视频扩展名
-        copy_mode: True=复制, False=移动
-    """
-    input_dir = Path(input_dir)
-    passed = []
-    failed = []
 
-    if output_dir:
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
+def process_segment(args, model, item, qualified_dir):
+    """处理单个视频片段：计算运动分数并判定。保留输入 CSV 全部列，追加运动过滤结果。"""
+    row = dict(item)
+    source_video = row.get(args.video_path_column, "")
+    row["source_video_path"] = source_video
+    row["video_path"] = ""
+    row["motion_reject_reason"] = ""
+    row["motion_score"] = ""
 
-    video_files = sorted([
-        f for f in input_dir.rglob("*")
-        if f.suffix.lower() in extensions and f.is_file()
-    ])
+    seg_path = Path(source_video)
+    if not seg_path.is_file():
+        row["motion_reject_reason"] = "file_not_found"
+        return row
 
-    print(f"找到 {len(video_files)} 个视频文件，使用 RAFT 光流进行动态性检测...")
-    print(f"参数: sampling_fps={sampling_fps}, iters={iters}, max_size={max_size}")
-    print(f"阈值: min={min_motion_score}, max={max_motion_score}")
-    print("-" * 60)
+    # 已存在则跳过
+    out_path = Path(qualified_dir) / seg_path.name
+    if out_path.exists():
+        print(f"  跳过(已存在): {seg_path.name}")
+        row["video_path"] = str(out_path)
+        return row
 
-    for i, video_path in enumerate(video_files, 1):
-        result = compute_motion_score_raft(
-            model, video_path,
-            sampling_fps=sampling_fps,
-            iters=iters,
-            max_size=max_size,
-        )
+    result = compute_motion_score(
+        model, str(seg_path),
+        sampling_fps=args.sampling_fps,
+        iters=args.raft_iters,
+        max_size=args.max_size,
+    )
+    if result is None:
+        row["motion_reject_reason"] = "compute_failed"
+        return row
 
-        if result is None:
-            print(f"[{i}/{len(video_files)}] 跳过（无法计算）: {video_path.name}")
-            failed.append({"path": str(video_path), "reason": "无法计算", "motion_score": None})
-            continue
+    score = result["motion_score"]
+    row["motion_score"] = score
 
-        score = result["motion_score"]
+    if score < args.min_motion:
+        row["motion_reject_reason"] = f"too_static_{score}"
+        print(f"  不通过: {seg_path.name} | score={score:.4f} < {args.min_motion}")
+        return row
+    if score > args.max_motion:
+        row["motion_reject_reason"] = f"too_dynamic_{score}"
+        print(f"  不通过: {seg_path.name} | score={score:.4f} > {args.max_motion}")
+        return row
 
-        if score < min_motion_score:
-            reason = f"运动分数 {score:.4f} < {min_motion_score}（画面过于静态）"
-            print(f"[{i}/{len(video_files)}] 不通过: {video_path.name} | {reason}")
-            failed.append({"path": str(video_path), "reason": reason, "motion_score": score})
-        elif score > max_motion_score:
-            reason = f"运动分数 {score:.4f} > {max_motion_score}（动态过大/抖动）"
-            print(f"[{i}/{len(video_files)}] 不通过: {video_path.name} | {reason}")
-            failed.append({"path": str(video_path), "reason": reason, "motion_score": score})
-        else:
-            print(f"[{i}/{len(video_files)}] 通过: {video_path.name} | 运动分数: {score:.4f}")
-            passed.append({"path": str(video_path), "motion_score": score})
+    # 通过
+    out_path = Path(qualified_dir) / seg_path.name
+    if args.copy_mode == "symlink":
+        if not out_path.exists():
+            out_path.symlink_to(seg_path.resolve())
+    elif args.copy_mode == "copy":
+        shutil.copy2(str(seg_path), str(out_path))
+    else:
+        out_path = seg_path
+    row["video_path"] = str(out_path)
+    print(f"  通过: {seg_path.name} | score={score:.4f}")
+    return row
 
-            if output_dir:
-                dest = output_dir / video_path.name
-                if copy_mode:
-                    shutil.copy2(video_path, dest)
-                else:
-                    shutil.move(str(video_path), str(dest))
 
-    print("-" * 60)
-    print(f"筛选完成: 通过 {len(passed)}, 不通过 {len(failed)}")
-    return passed, failed
+# ─── Worker ─────────────────────────────────────────────────────────────────
+class Worker:
+    def __init__(self):
+        self.output_dir = Path(args.output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.qualified_dir = self.output_dir / "qualified_videos"
+        self.qualified_dir.mkdir(parents=True, exist_ok=True)
+        self.all_csv = self.output_dir / "motion_filter_all.csv"
+        self.qual_csv = self.output_dir / "motion_filter_qualified.csv"
+        with open(args.input_csv, encoding="utf-8") as f:
+            input_fields = csv.DictReader(f).fieldnames or []
+        self.fieldnames = list(input_fields) + [c for c in ["source_video_path", "video_path"] + MOTION_FIELDS if c not in input_fields]
+        for p in (self.all_csv, self.qual_csv):
+            if not p.exists():
+                with open(p, "w", newline="", encoding="utf-8") as f:
+                    csv.DictWriter(f, fieldnames=self.fieldnames).writeheader()
+        print(f"加载 RAFT 模型: {args.raft_model}")
+        self.model = load_raft_model(args.raft_model, small=args.raft_small)
+        print("RAFT 模型加载完成")
+
+    def _append_csv(self, filepath, row):
+        with open(filepath, "a", newline="", encoding="utf-8") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            csv.DictWriter(f, fieldnames=self.fieldnames, extrasaction="ignore").writerow(row)
+            f.flush()
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+    def __call__(self, item):
+        seg_path = item.get(args.video_path_column, "")
+        if not seg_path:
+            row = dict(item)
+            row.update({k: "" for k in MOTION_FIELDS})
+            return row
+        row = process_segment(args, self.model, item, str(self.qualified_dir))
+        self._append_csv(self.all_csv, row)
+        if not row.get("motion_reject_reason"):
+            self._append_csv(self.qual_csv, row)
+        return row
+
+
+# ─── CLI ─────────────────────────────────────────────────────────────────
+RAFT_CKPT_DEFAULT = str(Path(__file__).resolve().parent.parent / "third_part" / "raft-things.pth")
+parser = argparse.ArgumentParser(description="RAFT 光流运动评分过滤")
+parser.add_argument("--input_csv", default="/mnt/workspace/lihaoran/data_process/test/result/0612/video_filter/data_5000_all_last/video_filter_qualified.csv")
+parser.add_argument("--output_dir", default="/mnt/workspace/lihaoran/data_process/test/result/0612/motion_filter_raft/data_5000_all_last/")
+parser.add_argument("--video_path_column", default="video_path")
+parser.add_argument("--raft_model", default=RAFT_CKPT_DEFAULT)
+parser.add_argument("--raft_small", action="store_true")
+parser.add_argument("--raft_iters", type=int, default=20)
+parser.add_argument("--min_motion", type=float, default=10)
+parser.add_argument("--max_motion", type=float, default=200)
+parser.add_argument("--sampling_fps", type=int, default=2)
+parser.add_argument("--max_size", type=int, default=512)
+parser.add_argument("--copy_mode", choices=["symlink", "copy", "none"], default="symlink")
+# Ray
+parser.add_argument("--ray", action="store_true", help="启用 Ray 分布式模式")
+parser.add_argument("--ray_num_gpus", type=float, default=0.5)
+parser.add_argument("--ray_num_cpus", type=float, default=0)
+parser.add_argument("--concurrency", type=int, default=4)
+args = parser.parse_args()
 
 
 if __name__ == "__main__":
-    # ========== 配置 ==========
-    MODEL_PATH = "/xsky/yangnq/yangfile/data_deal_video_audio/weights_all/raft-things.pth"
-    INPUT_DIR = "/xsky/yangnq/LM_data/zgtz_test/"         # 待筛选视频目录
-    OUTPUT_DIR = None              # 设为路径则复制通过的视频，None 只打印
 
-    MIN_MOTION = 10.0               # 最小运动分数（过滤静态）
-    MAX_MOTION = 200.0              # 最大运动分数（过滤剧烈抖动）
-    SAMPLING_FPS = 2               # 采样帧率
-    ITERS = 20                     # RAFT 迭代次数（12 快速，20 精确）
-    MAX_SIZE = 512                 # 推理分辨率（越小越快，精度略降）
-    # ===========================
+    if not args.ray:
+        # ── 本地模式 ──
+        samples = list(csv.DictReader(open(args.input_csv, encoding="utf-8")))
+        total = len(samples)
+        print(f"读取 {total} 条记录 from {args.input_csv}")
+        worker = Worker()
+        for i, item in enumerate(samples, 1):
+            print(f"[{i}/{total}] {item.get(args.video_path_column, '')}")
+            worker(item)
+        print("完成")
 
-    print("加载 RAFT 模型...")
-    model = load_raft_model(MODEL_PATH, small=False)
-    print("模型加载完成")
-
-    passed, failed = filter_by_motion_raft(
-        input_dir=INPUT_DIR,
-        model=model,
-        output_dir=OUTPUT_DIR,
-        min_motion_score=MIN_MOTION,
-        max_motion_score=MAX_MOTION,
-        sampling_fps=SAMPLING_FPS,
-        iters=ITERS,
-        max_size=MAX_SIZE,
-        copy_mode=True,
-    )
+    else:
+        # ── Ray 分布式模式 ──
+        import ray
+        ray.init(address="auto")
+        samples = ray.data.read_csv(args.input_csv)
+        predictions = samples.map(
+            Worker,
+            num_gpus=args.ray_num_gpus,
+            num_cpus=args.ray_num_cpus,
+            concurrency=args.concurrency,
+        )
+        predictions.take_all()
+        print("Ray 完成")

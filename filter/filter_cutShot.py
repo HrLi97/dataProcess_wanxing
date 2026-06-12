@@ -386,6 +386,7 @@ if __name__ == "__main__":
         predictions = samples.map(Worker, num_gpus=1, concurrency=args.concurrency)
         rows = predictions.take_all()
         for r in rows:
+            
             for row in r:
                 csv_writer.write_row(row)
     else:

@@ -2,8 +2,8 @@ import os
 import csv
 
 # 配置参数
-SOURCE_DIR = "/mnt/workspace/lihaoran/data_process/test/0521/YouTube_talk"
-OUTPUT_FILE = "/mnt/workspace/lihaoran/data_process/test/0521/YouTube_talk.csv"
+SOURCE_DIR = "/mnt/workspace/yangnq/refer/DiffSynth-Studio_sr/data_5000"
+OUTPUT_FILE = "/mnt/workspace/lihaoran/data_process/test_data/data_5000_all.csv"
 USE_ABSOLUTE_PATH = True  # True: 绝对路径, False: 相对路径
 
 def generate_csv():
@@ -14,7 +14,7 @@ def generate_csv():
     with open(OUTPUT_FILE, 'w', encoding='utf-8', newline='') as f:
         writer = csv.writer(f)
         # 写入表头
-        writer.writerow(["file_path"])
+        writer.writerow(["video_path"])
         
         # 递归遍历所有子目录
         for root, _, files in os.walk(SOURCE_DIR):
