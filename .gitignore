@@ -1,6 +1,14 @@
+./test/
+./data-process-old/
+./meta_data/
+./test_data/
+./data_process_v3.5/
+./docs/
+./.vscode/
+./third_part/
 
-# 模型权重文件（体积过大，不入库）
-*.pth
-*.ckpt
-*.bin
-*.pt
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.so

@@ -511,9 +511,9 @@ parser.add_argument("--kvq-cfg", default=str(CFG_KVQ_CFG))
 parser.add_argument("--kvq-weight", default=str(CFG_KVQ_WEIGHT))
 
 # 质量阈值（默认 0 表示不过滤）
-parser.add_argument("--min_dover_overall", type=float, default=0.4)
-parser.add_argument("--min_aes_mean", type=float, default=5)
-parser.add_argument("--min_kvq_score", type=float, default=0.01)
+parser.add_argument("--min_dover_overall", type=float, default=0.3)
+parser.add_argument("--min_aes_mean", type=float, default=4.2)
+parser.add_argument("--min_kvq_score", type=float, default=0.008)
 
 # Ray
 parser.add_argument("--ray", action="store_true", help="启用 Ray 分布式模式")

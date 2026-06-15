@@ -1,19 +1,4 @@
 #!/usr/bin/env python3
-"""
-OmniShotCut 后处理：SyncNet 音画同步筛选
-
-流程：InsightFace 人脸跟踪 → SyncNet 音画同步检测 → 综合决策
-
-SyncNet evaluates temporal audio-visual synchronization by computing
-offset and confidence between lip movements and speech audio.
-Decision: offset in [-6,6] AND confidence >= threshold → speaking.
-
-支持多说话人模式（PyAnnote）：
-  - 使用 PyAnnote 进行说话人分割（diarization）
-  - 将每个人脸轨迹匹配到对应的说话人时间段
-  - 对每个说话人分别运行 TalkNCE 和 SyncNet
-  - 任一说话人满足条件即视为合格片段
-"""
 import argparse
 import csv
 import fcntl

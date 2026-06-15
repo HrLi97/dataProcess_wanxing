@@ -111,6 +111,19 @@ RESOLUTION_PRESETS = {
 }
 
 
+# ─── 验证 MP4 文件有效性 ──────────────────────────────────────────────────────
+def _is_valid_mp4(path):
+    """用 ffprobe 快速验证文件是否可读（moov atom 存在且至少有一个视频流）。"""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=15,
+        )
+        return r.returncode == 0 and len(r.stdout.strip()) > 0
+    except Exception:
+        return False
+
 # ─── ffmpeg 转码 ─────────────────────────────────────────────────────────────
 def transcode_video(input_path, output_path,
                     need_fps=False, need_audio=False,
@@ -126,7 +139,7 @@ def transcode_video(input_path, output_path,
     # Video
     if need_fps:
         cmd += ["-r", str(target_fps),
-                "-c:v", "libx264", "-preset", "medium", "-crf", "8",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "15",
                 "-pix_fmt", "yuv420p"]
     else:
         cmd += ["-c:v", "copy"]
@@ -137,16 +150,20 @@ def transcode_video(input_path, output_path,
     else:
         cmd += ["-c:a", "copy"]
 
-    cmd += ["-loglevel", "warning", str(output_path)]
+    cmd += ["-movflags", "+faststart", "-loglevel", "warning", str(output_path)]
 
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
         if r.returncode != 0:
             print(f"  [transcode] ffmpeg error: {r.stderr[:300]}")
+            # 删除不完整文件
+            Path(output_path).unlink(missing_ok=True)
             return False
         return Path(output_path).exists()
     except subprocess.TimeoutExpired:
         print("  [transcode] timeout")
+        # 删除不完整文件
+        Path(output_path).unlink(missing_ok=True)
         return False
 
 
@@ -228,12 +245,16 @@ def process_segment(args, video_path, qualified_dir):
         out_name = f"{seg_path.stem}_25fps.mp4"
         out_path = Path(qualified_dir) / out_name
 
-        # 已存在则跳过
+        # 已存在则校验有效性（ffprobe 能否打开），损坏文件直接删除重新转码
         if out_path.exists():
-            print(f"  跳过(已存在): {out_name}")
-            row["video_path"] = str(out_path)
-            row["was_transcoded"] = True
-            return row
+            if _is_valid_mp4(str(out_path)):
+                print(f"  跳过(已存在): {out_name}")
+                row["video_path"] = str(out_path)
+                row["was_transcoded"] = True
+                return row
+            else:
+                print(f"  删除损坏文件: {out_name}")
+                out_path.unlink(missing_ok=True)
 
         tc_info = []
         if need_fps:
@@ -324,7 +345,7 @@ parser.add_argument("--copy_mode", choices=["symlink", "copy", "none"], default=
 # Ray
 parser.add_argument("--ray", action="store_true", help="启用 Ray 分布式模式")
 parser.add_argument("--ray_num_gpus", type=float, default=0.0)
-parser.add_argument("--ray_num_cpus", type=float, default=1)
+parser.add_argument("--ray_num_cpus", type=float, default=4)
 parser.add_argument("--concurrency", type=int, default=22)
 args = parser.parse_args()
 
