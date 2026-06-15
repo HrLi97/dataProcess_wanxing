@@ -28,3 +28,6 @@
 [submodule "third_part/ImageBind"]
 	path = third_part/ImageBind
 	url = https://github.com/facebookresearch/ImageBind.git
+[submodule "third_part/Music-Source-Separation-Training"]
+	path = third_part/Music-Source-Separation-Training
+	url = https://github.com/ZFTurbo/Music-Source-Separation-Training.git

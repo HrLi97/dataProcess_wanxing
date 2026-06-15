@@ -45,16 +45,11 @@ class PyannoteDiarizationRunner:
         if not self._available:
             return
         self._ensure_imported()
-        try:
-            import torch
-            from pyannote.audio import Pipeline
-            self.pipeline = Pipeline.from_pretrained(str(args.pyannote_model_path), token=args.pyannote_hf_token)
-            device_str = getattr(args, "device", "cpu")
-            self.pipeline.to(torch.device(device_str))
-        except Exception as e:
-            self._available = False
-            self._check_reason = str(e)
-            self.pipeline = None
+        import torch
+        from pyannote.audio import Pipeline
+        self.pipeline = Pipeline.from_pretrained(str(args.pyannote_model_path), token=args.pyannote_hf_token)
+        device_str = getattr(args, "device", "cpu")
+        self.pipeline.to(torch.device(device_str))
 
     def _ensure_imported(self):
         """Guarantee pyannote.audio is importable in this process."""
@@ -105,15 +100,12 @@ class PyannoteDiarizationRunner:
         raw_path = Path(str(wav_path).replace(".wav", ".raw"))
         if proc.returncode != 0 or not raw_path.is_file() or raw_path.stat().st_size == 0:
             return None
-        try:
-            import numpy as np
-            import torch
-            pcm = np.fromfile(str(raw_path), dtype=np.int16)
-            waveform = torch.from_numpy(pcm.astype(np.float32) / 32768.0).unsqueeze(0)
-            raw_path.unlink(missing_ok=True)
-            return {"waveform": waveform, "sample_rate": 16000}
-        except Exception:
-            return None
+        import numpy as np
+        import torch
+        pcm = np.fromfile(str(raw_path), dtype=np.int16)
+        waveform = torch.from_numpy(pcm.astype(np.float32) / 32768.0).unsqueeze(0)
+        raw_path.unlink(missing_ok=True)
+        return {"waveform": waveform, "sample_rate": 16000}
 
 
 class PyannoteDiarizationWorker:

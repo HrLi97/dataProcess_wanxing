@@ -414,14 +414,10 @@ class SyncNetRunner:
                 continue
 
             # Run SyncNet evaluation
-            try:
-                offset, conf, dists = _syncnet_evaluate(
-                    self.model, video_frames, audio_data,
-                    vshift=self.vshift, batch_size=self.batch_size,
-                )
-            except Exception as e:
-                print(f"[SyncNet] Evaluation error track {tid}: {e}")
-                continue
+            offset, conf, dists = _syncnet_evaluate(
+                self.model, video_frames, audio_data,
+                vshift=self.vshift, batch_size=self.batch_size,
+            )
 
             # Decision: offset in range AND confidence above threshold
             is_synced = (
@@ -478,11 +474,7 @@ class SyncNetWorker:
             self.static_status = "not_configured"
             return
 
-        try:
-            self.runner = SyncNetRunner(args)
-        except Exception as e:
-            self.static_status = f"load_error: {e}"
-            self.runner = None
+        self.runner = SyncNetRunner(args)
 
     def score(self, video_path, face_result, track_id=None, speaker_window=None):
         """Score lip-sync using SyncNet.

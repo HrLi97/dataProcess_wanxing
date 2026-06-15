@@ -220,10 +220,7 @@ class TalkNCEWorker:
             return {"status": self.static_status, "tracks": []}
         if not face_result["tracks"]:
             return {"status": "no_face", "tracks": []}
-        try:
-            result = self.runner.score(face_result, segment_path)
-        except Exception as e:
-            return {"status": "error", "error": str(e), "tracks": []}
+        result = self.runner.score(face_result, segment_path)
         if "tracks" not in result:
             result["tracks"] = []
         return result

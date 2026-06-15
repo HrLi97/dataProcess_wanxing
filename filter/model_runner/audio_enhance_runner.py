@@ -28,26 +28,20 @@ def _extract_audio_from_video(video_path, sr=44100):
     """Extract audio from video as numpy array at given sample rate."""
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp_path = tmp.name
-    try:
-        cmd = [
-            "ffmpeg", "-y", "-i", str(video_path),
-            "-vn", "-acodec", "pcm_s16le",
-            "-ar", str(sr), "-ac", "2",
-            "-f", "wav", "-loglevel", "quiet",
-            tmp_path,
-        ]
-        subprocess.run(cmd, check=True, capture_output=True)
-        import librosa
-        mix, _ = librosa.load(tmp_path, sr=sr, mono=False)
-        if len(mix.shape) == 1:
-            mix = np.stack([mix, mix], axis=0)
-        return mix
-    except Exception as e:
-        print(f"[AudioEnhance] Failed to extract audio from {video_path}: {e}")
-        return None
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+    cmd = [
+        "ffmpeg", "-y", "-i", str(video_path),
+        "-vn", "-acodec", "pcm_s16le",
+        "-ar", str(sr), "-ac", "2",
+        "-f", "wav", "-loglevel", "quiet",
+        tmp_path,
+    ]
+    subprocess.run(cmd, check=True, capture_output=True)
+    import librosa
+    mix, _ = librosa.load(tmp_path, sr=sr, mono=False)
+    if len(mix.shape) == 1:
+        mix = np.stack([mix, mix], axis=0)
+    return mix
+
 
 
 def _run_separation(model, config, mix, device, use_tta=False):
@@ -118,33 +112,26 @@ class AudioEnhanceRunner:
             return
 
         # Load MelBandRoformer
-        try:
-            import sys
-            if mss_root and mss_root not in sys.path:
-                sys.path.insert(0, mss_root)
-            from utils_separation import get_model_from_config
+        import sys
+        if mss_root and mss_root not in sys.path:
+            sys.path.insert(0, mss_root)
+        from utils_separation import get_model_from_config
 
-            model, config = get_model_from_config("mel_band_roformer", sep_config_path)
-            state_dict = torch.load(sep_ckpt_path, map_location=self.device)
-            model.load_state_dict(state_dict)
-            self.model = model.to(self.device).eval()
-            self.config = config
-            print(f"[AudioEnhance] MelBandRoformer loaded from {sep_ckpt_path}")
-        except Exception as e:
-            print(f"[AudioEnhance] Failed to load separation model: {e}")
-            self.model = None
+        model, config = get_model_from_config("mel_band_roformer", sep_config_path)
+        state_dict = torch.load(sep_ckpt_path, map_location=self.device)
+        model.load_state_dict(state_dict)
+        self.model = model.to(self.device).eval()
+        self.config = config
+        print(f"[AudioEnhance] MelBandRoformer loaded from {sep_ckpt_path}")
 
         # Load ClearVoice
-        try:
-            from clearvoice.clearvoice import ClearVoice
-            self.clearvoice = ClearVoice(
-                task="speech_enhancement",
-                model_names=["MossFormer2_SE_48K"],
-            )
-            print("[AudioEnhance] ClearVoice (MossFormer2_SE_48K) loaded.")
-        except Exception as e:
-            print(f"[AudioEnhance] Failed to load ClearVoice: {e}")
-            self.clearvoice = None
+        from clearvoice.clearvoice import ClearVoice
+        self.clearvoice = ClearVoice(
+            task="speech_enhancement",
+            model_names=["MossFormer2_SE_48K"],
+        )
+        print("[AudioEnhance] ClearVoice (MossFormer2_SE_48K) loaded.")
+
 
     @property
     def is_available(self):
@@ -174,14 +161,10 @@ class AudioEnhanceRunner:
             return {"status": "no_audio", "enhanced_audio_path": None, "vocals_path": None}
 
         # Step 2: Source separation
-        try:
-            sep_result = _run_separation(
-                self.model, self.config, mix, self.device,
-                use_tta=getattr(self.args, "audio_sep_tta", False),
-            )
-        except Exception as e:
-            print(f"[AudioEnhance] Separation failed: {e}")
-            return {"status": "error", "enhanced_audio_path": None, "vocals_path": None}
+        sep_result = _run_separation(
+            self.model, self.config, mix, self.device,
+            use_tta=getattr(self.args, "audio_sep_tta", False),
+        )
 
         # Step 3: Save vocals
         import soundfile as sf
@@ -201,13 +184,10 @@ class AudioEnhanceRunner:
         # Step 4: Speech enhancement (ClearVoice)
         enhanced_path = vocals_path
         if self.clearvoice is not None:
-            try:
-                enhanced_out = output_dir / f"{stem}_enhanced.wav"
-                output_wav = self.clearvoice(input_path=str(vocals_path), online_write=False)
-                self.clearvoice.write(output_wav, output_path=str(enhanced_out))
-                enhanced_path = enhanced_out
-            except Exception as e:
-                print(f"[AudioEnhance] ClearVoice enhancement failed: {e}")
+            enhanced_out = output_dir / f"{stem}_enhanced.wav"
+            output_wav = self.clearvoice(input_path=str(vocals_path), online_write=False)
+            self.clearvoice.write(output_wav, output_path=str(enhanced_out))
+            enhanced_path = enhanced_out
 
         # Step 5: Convert to 16kHz mono for downstream
         final_16k_path = output_dir / f"{stem}_enhanced_16k.wav"
@@ -259,13 +239,9 @@ class AudioEnhanceWorker:
             self.static_status = "not_configured"
             return
 
-        try:
-            self.runner = AudioEnhanceRunner(args)
-            if not self.runner.is_available:
-                self.static_status = "load_failed"
-                self.runner = None
-        except Exception as e:
-            self.static_status = f"load_error: {e}"
+        self.runner = AudioEnhanceRunner(args)
+        if not self.runner.is_available:
+            self.static_status = "load_failed"
             self.runner = None
 
     def enhance(self, video_path, output_dir=None):

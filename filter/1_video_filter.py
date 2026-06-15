@@ -331,11 +331,22 @@ args = parser.parse_args()
 
 if __name__ == "__main__":
 
+    # ── 去重：按 video_path_column 去重，避免重复处理 ──
+    import pandas as pd
+    df = pd.read_csv(args.input_csv, encoding="utf-8")
+    before_cnt = len(df)
+    df = df.drop_duplicates(subset=[args.video_path_column], keep="first")
+    after_cnt = len(df)
+    if before_cnt != after_cnt:
+        print(f"去重: {before_cnt} → {after_cnt} (去除 {before_cnt - after_cnt} 条重复)")
+    deduped_csv = args.input_csv.replace(".csv", "_deduped.csv")
+    df.to_csv(deduped_csv, index=False)
+
     if not args.ray:
         # ── 本地模式 ──
-        samples = list(csv.DictReader(open(args.input_csv, encoding="utf-8")))
+        samples = list(csv.DictReader(open(deduped_csv, encoding="utf-8")))
         total = len(samples)
-        print(f"读取 {total} 条记录 from {args.input_csv}")
+        print(f"读取 {total} 条记录 from {deduped_csv}")
         worker = Worker()
         for i, item in enumerate(samples, 1):
             print(f"[{i}/{total}] {item.get(args.video_path_column, '')}")
@@ -346,7 +357,7 @@ if __name__ == "__main__":
         # ── Ray 分布式模式 ──
         import ray
         ray.init(address="auto")
-        samples = ray.data.read_csv(args.input_csv)
+        samples = ray.data.read_csv(deduped_csv)
         predictions = samples.map(
             Worker,
             num_gpus=args.ray_num_gpus,

@@ -115,12 +115,8 @@ class SemanticSyncRunner:
         self.threshold = getattr(args, "semantic_sync_threshold", 0.15)
         self.max_frames = getattr(args, "semantic_sync_max_frames", 5)
 
-        try:
-            self.model, self.ModalityType = _load_imagebind_model(self.device)
-            print(f"[SemanticSync] ImageBind loaded on {self.device}")
-        except Exception as e:
-            print(f"[SemanticSync] Failed to load ImageBind: {e}")
-            self.model = None
+        self.model, self.ModalityType = _load_imagebind_model(self.device)
+        print(f"[SemanticSync] ImageBind loaded on {self.device}")
 
     @property
     def is_available(self):
@@ -216,13 +212,6 @@ class SemanticSyncRunner:
                 "is_semantically_synced": similarity > self.threshold,
             }
 
-        except Exception as e:
-            print(f"[SemanticSync] Error: {e}")
-            return {
-                "status": "error",
-                "semantic_score": None,
-                "is_semantically_synced": False,
-            }
         finally:
             # Cleanup temp files
             import shutil
@@ -256,14 +245,7 @@ class SemanticSyncWorker:
             self.static_status = "imagebind_not_found"
             return
 
-        try:
-            self.runner = SemanticSyncRunner(args)
-            if not self.runner.is_available:
-                self.static_status = "load_failed"
-                self.runner = None
-        except Exception as e:
-            self.static_status = f"load_error: {e}"
-            self.runner = None
+        self.runner = SemanticSyncRunner(args)
 
     def score(self, video_path, enhanced_audio_path=None):
         """Score semantic audio-visual sync.

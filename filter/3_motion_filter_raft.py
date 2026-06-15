@@ -4,6 +4,7 @@
 import argparse
 import csv
 import fcntl
+import os
 import shutil
 from pathlib import Path
 
@@ -781,8 +782,8 @@ class Worker:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.qualified_dir = self.output_dir / "qualified_videos"
         self.qualified_dir.mkdir(parents=True, exist_ok=True)
-        self.all_csv = self.output_dir / "motion_filter_all.csv"
-        self.qual_csv = self.output_dir / "motion_filter_qualified.csv"
+        self.all_csv = self.output_dir / "3_motion_filter_all.csv"
+        self.qual_csv = self.output_dir / "3_motion_filter_qualified.csv"
         with open(args.input_csv, encoding="utf-8") as f:
             input_fields = csv.DictReader(f).fieldnames or []
         self.fieldnames = list(input_fields) + [c for c in ["source_video_path", "video_path"] + MOTION_FIELDS if c not in input_fields]
@@ -813,7 +814,6 @@ class Worker:
             self._append_csv(self.qual_csv, row)
         return row
 
-
 # ─── CLI ─────────────────────────────────────────────────────────────────
 RAFT_CKPT_DEFAULT = str(Path(__file__).resolve().parent.parent / "third_part" / "raft-things.pth")
 parser = argparse.ArgumentParser(description="RAFT 光流运动评分过滤")
@@ -828,6 +828,7 @@ parser.add_argument("--max_motion", type=float, default=200)
 parser.add_argument("--sampling_fps", type=int, default=2)
 parser.add_argument("--max_size", type=int, default=512)
 parser.add_argument("--copy_mode", choices=["symlink", "copy", "none"], default="symlink")
+
 # Ray
 parser.add_argument("--ray", action="store_true", help="启用 Ray 分布式模式")
 parser.add_argument("--ray_num_gpus", type=float, default=0.5)
@@ -838,11 +839,22 @@ args = parser.parse_args()
 
 if __name__ == "__main__":
 
+    # ── 去重：按 video_path_column 去重，避免重复处理 ──
+    import pandas as pd
+    df = pd.read_csv(args.input_csv, encoding="utf-8")
+    before_cnt = len(df)
+    df = df.drop_duplicates(subset=[args.video_path_column], keep="first")
+    after_cnt = len(df)
+    if before_cnt != after_cnt:
+        print(f"去重: {before_cnt} → {after_cnt} (去除 {before_cnt - after_cnt} 条重复)")
+    deduped_csv = args.input_csv.replace(".csv", "_deduped.csv")
+    df.to_csv(deduped_csv, index=False)
+
     if not args.ray:
         # ── 本地模式 ──
-        samples = list(csv.DictReader(open(args.input_csv, encoding="utf-8")))
+        samples = list(csv.DictReader(open(deduped_csv, encoding="utf-8")))
         total = len(samples)
-        print(f"读取 {total} 条记录 from {args.input_csv}")
+        print(f"读取 {total} 条记录 from {deduped_csv}")
         worker = Worker()
         for i, item in enumerate(samples, 1):
             print(f"[{i}/{total}] {item.get(args.video_path_column, '')}")
@@ -853,7 +865,7 @@ if __name__ == "__main__":
         # ── Ray 分布式模式 ──
         import ray
         ray.init(address="auto")
-        samples = ray.data.read_csv(args.input_csv)
+        samples = ray.data.read_csv(deduped_csv)
         predictions = samples.map(
             Worker,
             num_gpus=args.ray_num_gpus,
