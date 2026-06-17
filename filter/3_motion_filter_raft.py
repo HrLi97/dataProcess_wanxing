@@ -6,6 +6,7 @@ import csv
 import fcntl
 import os
 import shutil
+import sys
 from pathlib import Path
 
 import cv2
@@ -13,6 +14,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+_FILTER_ROOT = str(Path(__file__).resolve().parents[1]) 
+if _FILTER_ROOT not in sys.path:
+    sys.path.insert(0, _FILTER_ROOT)
+
+from filter.filter_utils import unique_output_name, worker_syspath_setup
+
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -31,8 +40,6 @@ except:
         def __exit__(self, *args):
             pass
 
-
-# --- utils ---
 
 class InputPadder:
     """Pads images such that dimensions are divisible by 8"""
@@ -722,7 +729,8 @@ def process_segment(args, model, item, qualified_dir):
     """处理单个视频片段：计算运动分数并判定。保留输入 CSV 全部列，追加运动过滤结果。"""
     row = dict(item)
     source_video = row.get(args.video_path_column, "")
-    row["source_video_path"] = source_video
+    # 输入行是源视频路径；输出 video_path 在我们这里也表示"当前处理视频"的最终落点。
+    # 不再保留重复的 source_video_path 字段。
     row["video_path"] = ""
     row["motion_reject_reason"] = ""
     row["motion_score"] = ""
@@ -732,10 +740,13 @@ def process_segment(args, model, item, qualified_dir):
         row["motion_reject_reason"] = "file_not_found"
         return row
 
-    # 已存在则跳过
-    out_path = Path(qualified_dir) / seg_path.name
+    # 输出文件名加源视频 hash 短码，避免不同源同名时冲突
+    out_name = unique_output_name(seg_path, suffix=".mp4")
+    out_path = Path(qualified_dir) / out_name
+
+    # 已存在则跳过（断点续跑 / 重新跑）
     if out_path.exists():
-        print(f"  跳过(已存在): {seg_path.name}")
+        print(f"  跳过(已存在): {out_name}")
         row["video_path"] = str(out_path)
         return row
 
@@ -761,11 +772,8 @@ def process_segment(args, model, item, qualified_dir):
         print(f"  不通过: {seg_path.name} | score={score:.4f} > {args.max_motion}")
         return row
 
-    # 通过
-    out_path = Path(qualified_dir) / seg_path.name
     if args.copy_mode == "symlink":
-        if not out_path.exists():
-            out_path.symlink_to(seg_path.resolve())
+        out_path.symlink_to(seg_path.resolve())
     elif args.copy_mode == "copy":
         shutil.copy2(str(seg_path), str(out_path))
     else:
@@ -778,6 +786,7 @@ def process_segment(args, model, item, qualified_dir):
 # ─── Worker ─────────────────────────────────────────────────────────────────
 class Worker:
     def __init__(self):
+        worker_syspath_setup()  # Ray worker 端把 data_process/ 加进 sys.path
         self.output_dir = Path(args.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.qualified_dir = self.output_dir / "qualified_videos"
@@ -786,14 +795,23 @@ class Worker:
         self.qual_csv = self.output_dir / "3_motion_filter_qualified.csv"
         with open(args.input_csv, encoding="utf-8") as f:
             input_fields = csv.DictReader(f).fieldnames or []
-        self.fieldnames = list(input_fields) + [c for c in ["source_video_path", "video_path"] + MOTION_FIELDS if c not in input_fields]
+        # 不再额外加 source_video_path；video_path 表示当前处理视频的路径
+        self.fieldnames = list(input_fields) + [c for c in ["video_path"] + MOTION_FIELDS if c not in input_fields]
         for p in (self.all_csv, self.qual_csv):
             if not p.exists():
                 with open(p, "w", newline="", encoding="utf-8") as f:
                     csv.DictWriter(f, fieldnames=self.fieldnames).writeheader()
+        # 断点续跑：加载已处理的 video_path（输出路径就是当前处理视频的最终落点）
+        self.processed = set()
+        if self.all_csv.exists():
+            with open(self.all_csv, encoding="utf-8") as f:
+                for r in csv.DictReader(f):
+                    vp = r.get("video_path", "")
+                    if vp:
+                        self.processed.add(vp)
         print(f"加载 RAFT 模型: {args.raft_model}")
         self.model = load_raft_model(args.raft_model, small=args.raft_small)
-        print("RAFT 模型加载完成")
+        print(f"RAFT 模型加载完成. 已处理 {len(self.processed)} 条。")
 
     def _append_csv(self, filepath, row):
         with open(filepath, "a", newline="", encoding="utf-8") as f:
@@ -808,17 +826,22 @@ class Worker:
             row = dict(item)
             row.update({k: "" for k in MOTION_FIELDS})
             return row
+        if seg_path in self.processed:
+            row = dict(item)
+            row.update({k: "" for k in MOTION_FIELDS})
+            return row
         row = process_segment(args, self.model, item, str(self.qualified_dir))
         self._append_csv(self.all_csv, row)
         if not row.get("motion_reject_reason"):
             self._append_csv(self.qual_csv, row)
+        self.processed.add(seg_path)
         return row
 
 # ─── CLI ─────────────────────────────────────────────────────────────────
 RAFT_CKPT_DEFAULT = str(Path(__file__).resolve().parent.parent / "third_part" / "raft-things.pth")
 parser = argparse.ArgumentParser(description="RAFT 光流运动评分过滤")
-parser.add_argument("--input_csv", default="/mnt/workspace/lihaoran/data_process/test/result/0612/video_filter/data_5000_all_last/video_filter_qualified.csv")
-parser.add_argument("--output_dir", default="/mnt/workspace/lihaoran/data_process/test/result/0612/motion_filter_raft/data_5000_all_last/")
+parser.add_argument("--input_csv", default="/mnt/workspace/lihaoran/data_process/test/result/0617/filter_shotcut/data_5000_all/2_cutshot_qualified.csv")
+parser.add_argument("--output_dir", default="/mnt/workspace/lihaoran/data_process/test/result/0617/motion_filter_raft/data_5000_all/")
 parser.add_argument("--video_path_column", default="video_path")
 parser.add_argument("--raft_model", default=RAFT_CKPT_DEFAULT)
 parser.add_argument("--raft_small", action="store_true")
@@ -831,9 +854,9 @@ parser.add_argument("--copy_mode", choices=["symlink", "copy", "none"], default=
 
 # Ray
 parser.add_argument("--ray", action="store_true", help="启用 Ray 分布式模式")
-parser.add_argument("--ray_num_gpus", type=float, default=0.5)
+parser.add_argument("--ray_num_gpus", type=float, default=0.2)
 parser.add_argument("--ray_num_cpus", type=float, default=0)
-parser.add_argument("--concurrency", type=int, default=4)
+parser.add_argument("--concurrency", type=int, default=10)
 args = parser.parse_args()
 
 
@@ -864,13 +887,23 @@ if __name__ == "__main__":
     else:
         # ── Ray 分布式模式 ──
         import ray
-        ray.init(address="auto")
-        samples = ray.data.read_csv(deduped_csv)
+        ray.init(address="auto",
+                 runtime_env={"env_vars": 
+                                {"PYTHONPATH": _FILTER_ROOT,
+                                 "DATA_PROCESS_ROOT": _FILTER_ROOT},
+                            }
+                )
+
+        from ray.data import ActorPoolStrategy
+        samples = ray.data.read_csv(deduped_csv).materialize()
+        target_parallelism = min(args.concurrency, samples.count())
+        if samples.num_blocks() < target_parallelism:
+            samples = samples.repartition(target_parallelism)
         predictions = samples.map(
             Worker,
             num_gpus=args.ray_num_gpus,
-            num_cpus=args.ray_num_cpus,
-            concurrency=args.concurrency,
+            num_cpus=max(args.ray_num_cpus, 1),
+            compute=ActorPoolStrategy(size=target_parallelism),
         )
         predictions.take_all()
         print("Ray 完成")

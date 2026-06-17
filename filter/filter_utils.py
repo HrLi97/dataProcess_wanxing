@@ -1,6 +1,7 @@
 """共享工具函数，所有 Runner 均可引用。"""
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -74,6 +75,21 @@ def write_json(path, data):
 
 def safe_name(text):
     return re.sub(r"[^0-9A-Za-z._-]+", "_", str(text)).strip("_") or "item"
+
+
+def unique_output_name(src_path, suffix=".mp4", hash_len=8):
+    """根据源视频的绝对路径生成全局唯一的输出文件名。
+
+    目的：两个不同目录的源视频如果 stem 相同（重命名/重编码副本），
+    也不会在 qualified_videos/ 下互相覆盖。
+
+    格式: {safe_stem}__{hash[:hash_len]}{suffix}
+    其中 hash = md5(abs path)，确保对同一文件稳定、对不同文件唯一。
+    """
+    p = Path(str(src_path)).resolve()
+    h = hashlib.md5(str(p).encode("utf-8")).hexdigest()[:hash_len]
+    stem = safe_name(p.stem) or "item"
+    return f"{stem}__{h}{suffix}"
 
 
 def link_or_copy(src, dst, mode):
@@ -311,3 +327,91 @@ class JsonlWriter:
         with open(self.path, "a", encoding="utf-8") as f:
             f.write("\n".join(self._buf) + "\n")
         self._buf.clear()
+
+
+# ─── 跨 server 部署：项目根 / ckpt 根 解析 ────────────────────────────────────────
+
+def project_root() -> Path:
+    """
+    项目根目录（data_process/）。
+
+    解析顺序：
+      1. 环境变量 DATA_PROCESS_ROOT（最高优先级，跨 server 部署时注入）
+      2. 本文件 __file__ 相对位置（filter/filter_utils.py → 上一级 = data_process/）
+    """
+    env = os.environ.get("DATA_PROCESS_ROOT")
+    if env:
+        return Path(env).resolve()
+    return Path(__file__).resolve().parents[1]
+
+
+def ckps_root() -> Path:
+    """
+    外部 ckpt 根目录（与项目根同级别或由 env 注入）。
+
+    解析顺序：
+      1. 环境变量 CKPS_ROOT
+      2. 项目根的父级/ckps（与项目平级部署时）
+      3. 项目根/ckps（项目内）
+    """
+    env = os.environ.get("CKPS_ROOT")
+    if env:
+        return Path(env).resolve()
+    # 默认：项目根的父级 + ckps（与原布局 /mnt/workspace/lihaoran/ckps 兼容）
+    return project_root().parent / "ckps"
+
+
+def env_or(env_key: str, default: "str | Path") -> Path:
+    """环境变量优先；否则返回 default（已 resolve 为 Path）。"""
+    val = os.environ.get(env_key)
+    if val:
+        return Path(val).resolve()
+    return Path(default).resolve()
+
+
+def worker_syspath_setup():
+    """
+    Ray worker 端在 Worker.__init__ 第一行调用：把 data_process/ 根塞进 sys.path，
+    让 `from filter.xxx import ...` 在 worker 节点上也能解析。
+
+    触发原因：
+        head 节点用 `cd data_process/` 起 Ray 进程，__file__ 顶部那段
+        `sys.path.insert(0, _FILTER_ROOT)` 在 head 端跑过。
+        worker 节点的 cwd 通常不是 data_process/，所以 __file__ 顶部
+        的 sys.path 注入**没有在 worker 端执行**。再加上
+        `filter.*` 在 pickle 反序列化时去找 top-level package `filter`，
+        找不到就 ModuleNotFoundError。
+
+    安全性：
+        - 幂等：sys.path 已含 project_root 则不重复插入
+        - 静默失败：找不到 __file__ 时使用 cwd 兜底
+    """
+    import sys
+    import importlib
+    from pathlib import Path
+
+    # 1) 用本文件 (filter_utils.py) 的位置推断项目根
+    try:
+        project_root = str(Path(__file__).resolve().parents[1])
+    except NameError:
+        # 极少见：__file__ 不存在（如 zipapp / exec string）
+        project_root = str(Path.cwd())
+
+    # 2) 注入 sys.path
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+
+    # 3) 把 filter 这个 top-level package 真正 import 进来。
+    #    关键：当 head 端用 `from filter.filter_utils import ...` 时，Python
+    #    会在 sys.modules 里写一个 None 占位（防止循环 import 副作用）。
+    #    worker 端再走 `import filter` 时，Python 看到 None 占位就直接
+    #    raise ImportError: import of filter halted; None in sys.modules。
+    #    显式 importlib.import_module 把真正的 filter package 对象塞回去。
+    if "filter" not in sys.modules or sys.modules.get("filter") is None:
+        try:
+            importlib.import_module("filter")
+        except Exception:
+            # 项目根不在 data_process/ 或 filter 不是 package；不阻断 worker
+            pass
+
+    return project_root

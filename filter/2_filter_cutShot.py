@@ -17,6 +17,13 @@ import argparse
 import logging
 import re
 import subprocess
+from pathlib import Path
+
+_FILTER_ROOT = str(Path(__file__).resolve().parents[1]) 
+if _FILTER_ROOT not in sys.path:
+    sys.path.insert(0, _FILTER_ROOT)
+
+from filter.filter_utils import unique_output_name, safe_name 
 
 # ── 将 OmniShotCut 项目根目录加入 sys.path ──
 OMNISHOTCUT_ROOT = os.path.abspath(
@@ -36,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 
 CUTSHOT_FIELDS = [
-    "source_video_path", "video_path", "duration_frames","transition_type",
+    "video_path", "duration_frames","transition_type",
     "is_clean_shot", "cutshot_reject_reason",
 ]
 
@@ -48,7 +55,9 @@ def safe_name(text):
 def write_segment_video(video_path, scene, output_dir, fps):
     """用 ffmpeg 直接切割视频片段（无需逐帧重编码，速度快）。"""
     base_name = os.path.splitext(os.path.basename(video_path))[0]
-    segment_dir = os.path.join(output_dir, "segments", safe_name(base_name))
+    # 目录名加源视频 hash 短码，避免不同源同名时在 segments/ 下目录冲突
+    src_tag = unique_output_name(video_path, suffix="").rsplit("__", 1)[-1]
+    segment_dir = os.path.join(output_dir, "segments", f"{safe_name(base_name)}__{src_tag}")
     os.makedirs(segment_dir, exist_ok=True)
 
     t_type = safe_name(scene["transition_type"])
@@ -221,7 +230,7 @@ def process_single_video(video_path, model, model_args, opt, input_item):
     """处理单个视频，返回多行结果（每个 segment 一行）。"""
     if not os.path.isfile(video_path):
         return [{
-            "source_video_path": video_path, "video_path": "",
+            "video_path": "",
             "duration_frames": "",
             "transition_type": "", "is_clean_shot": False,
             "cutshot_reject_reason": "file_not_found",
@@ -235,7 +244,7 @@ def process_single_video(video_path, model, model_args, opt, input_item):
     except Exception as e:
         logger.warning(f"场景检测失败: {video_path}, err={e}")
         return [{
-            "source_video_path": video_path, "video_path": "",
+            "video_path": "",
             "duration_frames": "",
             "transition_type": "", "is_clean_shot": False,
             "cutshot_reject_reason": "detection_failed",
@@ -246,7 +255,6 @@ def process_single_video(video_path, model, model_args, opt, input_item):
     out_rows = []
     for seg_row in segment_rows:
         row = {
-            "source_video_path": video_path,
             "video_path": seg_row.get("segment_video_path", ""),
             "duration_frames": seg_row.get("duration_frames", ""),
             "transition_type": seg_row.get("transition_type", ""),
@@ -267,6 +275,21 @@ def process_single_video(video_path, model, model_args, opt, input_item):
 # ────────────────────── Worker ──────────────────────────────
 class Worker:
     def __init__(self):
+        import sys
+        import importlib
+        from pathlib import Path
+        try:
+            _project_root = str(Path(__file__).resolve().parents[1])  # data_process/
+        except NameError:
+            _project_root = str(Path.cwd())
+        if _project_root not in sys.path:
+            sys.path.insert(0, _project_root)
+        if "filter" not in sys.modules or sys.modules.get("filter") is None:
+            try:
+                importlib.import_module("filter")
+            except Exception:
+                pass
+
         os.chdir(OMNISHOTCUT_ROOT)
         sys.path.insert(0, OMNISHOTCUT_ROOT)
         from test_code.inference import load_model
@@ -281,7 +304,15 @@ class Worker:
             if not os.path.exists(p):
                 with open(p, "w", newline="", encoding="utf-8") as f:
                     csv.DictWriter(f, fieldnames=self.fieldnames).writeheader()
-        logger.info("Worker initialized: OmniShotCut model loaded.")
+        # 断点续跑：加载已处理的 video_path
+        self.processed = set()
+        if os.path.exists(self.all_csv):
+            with open(self.all_csv, encoding="utf-8") as f:
+                for r in csv.DictReader(f):
+                    sv = r.get("video_path", "")
+                    if sv:
+                        self.processed.add(sv)
+        logger.info(f"Worker initialized: OmniShotCut model loaded. 已处理 {len(self.processed)} 条。")
 
     def _append_csv(self, filepath, row):
         with open(filepath, "a", newline="", encoding="utf-8") as f:
@@ -297,11 +328,14 @@ class Worker:
             row["cutshot_reject_reason"] = "empty_path"
             self._append_csv(self.all_csv, row)
             return row
+        if vid_path in self.processed:
+            return {k: "" for k in CUTSHOT_FIELDS}
         rows = process_single_video(vid_path, self.model, self.model_args, args, item)
         for row in rows:
             self._append_csv(self.all_csv, row)
             if not row.get("cutshot_reject_reason"):
                 self._append_csv(self.qual_csv, row)
+        self.processed.add(vid_path)
         return rows[0] if rows else {k: "" for k in CUTSHOT_FIELDS}
 
 
@@ -314,8 +348,8 @@ class Worker:
 #   "Transition_Source" = 转场源镜头尾部 (rejected)
 #   "Padding"           = 无效 padding (rejected)
 parser = argparse.ArgumentParser(description="OmniShotCut 场景切分 (Ray / Local)")
-parser.add_argument("--input_csv", type=str, default="/mnt/workspace/lihaoran/data_process/test/result/0612/motion_filter_raft/data_5000_all_last/motion_filter_qualified.csv", help="输入 CSV")
-parser.add_argument("--output_dir", type=str, default="/mnt/workspace/lihaoran/data_process/test/result/0612/filter_shotcut/data_5000_all_last/", help="输出根目录")
+parser.add_argument("--input_csv", type=str, default="/mnt/workspace/lihaoran/data_process/test/result/0617/video_filter/data_5000_all/video_filter_qualified.csv", help="输入 CSV")
+parser.add_argument("--output_dir", type=str, default="/mnt/workspace/lihaoran/data_process/test/result/0617/filter_shotcut/data_5000_all/", help="输出根目录")
 parser.add_argument("--video_path_column", type=str, default="video_path", help="输入 CSV 中视频路径列名")
 parser.add_argument("--checkpoint_path", type=str, default=os.path.join(OMNISHOTCUT_ROOT, "checkpoints", "OmniShotCut_ckpt.pth"))
 parser.add_argument("--mode", type=str, default="clean_shot", choices=["default", "clean_shot"], help="clean_shot 只保留 general 硬切镜头")
@@ -354,14 +388,22 @@ if __name__ == "__main__":
         # ── Ray 分布式模式 ──
         import ray
         ray.init(address="auto",
-                 runtime_env={"env_vars": {"PYTHONPATH": OMNISHOTCUT_ROOT},
-                              "working_dir": OMNISHOTCUT_ROOT})
-        samples = ray.data.read_csv(deduped_csv)
+                 runtime_env={"env_vars": 
+                                {"PYTHONPATH": f"{_FILTER_ROOT}:{OMNISHOTCUT_ROOT}",
+                                "DATA_PROCESS_ROOT": _FILTER_ROOT},
+                                "working_dir": OMNISHOTCUT_ROOT
+                            }
+                )
+        from ray.data import ActorPoolStrategy
+        samples = ray.data.read_csv(deduped_csv).materialize()
+        target_parallelism = min(args.concurrency, samples.count())
+        if samples.num_blocks() < target_parallelism:
+            samples = samples.repartition(target_parallelism)
         predictions = samples.map(
             Worker,
             num_gpus=args.ray_num_gpus,
-            num_cpus=args.ray_num_cpus,
-            concurrency=args.concurrency,
+            num_cpus=max(args.ray_num_cpus, 1),
+            compute=ActorPoolStrategy(size=target_parallelism),
         )
         predictions.take_all()
 

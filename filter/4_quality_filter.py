@@ -14,11 +14,19 @@ import numpy as np
 import torch
 import yaml
 
+# 让 from filter.xxx import ... 可用
+_FILTER_ROOT = Path(__file__).resolve().parents[1]
+if str(_FILTER_ROOT) not in sys.path:
+    sys.path.insert(0, str(_FILTER_ROOT))
+
+from filter.filter_utils import project_root, ckps_root, env_or, worker_syspath_setup  # noqa: E402
+
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # third_part 根目录（包含三个子项目）
-CFG_third_part   = Path("/mnt/workspace/lihaoran/data_process/third_part")
+# 优先级：env DATA_PROCESS_ROOT > 项目根/third_part
+CFG_third_part   = project_root() / "third_part"
 
 # DOVER
 CFG_DOVER_CFG    = CFG_third_part / "DOVER-master" / "dover.yml"
@@ -26,7 +34,9 @@ CFG_DOVER_WEIGHT = CFG_third_part / "DOVER-master" / "pretrained_weights" / "DOV
 
 # Aesthetic Predictor V2.5
 CFG_AES_WEIGHT   = CFG_third_part / "aesthetic-predictor-v2-5" / "models" / "aesthetic_predictor_v2_5.pth"
-CFG_AES_ENCODER  = "/mnt/workspace/lihaoran/ckps/google/siglip-so400m-patch14-384/models--google--siglip-so400m-patch14-384/snapshots/9fdffc58afc957d1a03a25b10dba0329ab15c2a3" 
+# AES 编码器是 HuggingFace snapshot 目录；默认放在 third_part/google 下
+# 跨 server 部署时可被 env SIGLIP_ENCODER_PATH 覆盖
+CFG_AES_ENCODER  = str(env_or("SIGLIP_ENCODER_PATH", ckps_root() / "google" / "siglip-so400m-patch14-384" / "models--google--siglip-so400m-patch14-384" / "snapshots" / "9fdffc58afc957d1a03a25b10dba0329ab15c2a3"))
 
 # KVQ
 CFG_KVQ_CFG      = CFG_third_part / "KVQ" / "configs" / "test.yaml"
@@ -38,6 +48,13 @@ CFG_VIDEO_EXTS   = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv"}
 CFG_USE_DOVER    = True
 CFG_USE_AES      = True
 CFG_USE_KVQ      = True
+CFG_USE_OCR      = True
+
+# ── OCR (PaddleOCR) 路径配置 ─────────────────────────────────────────────
+# PaddleOCR 项目根（默认 third_part/PaddleOCR，可被 env PADDLEOCR_ROOT 覆盖）
+CFG_PADDLEOCR_ROOT  = env_or("PADDLEOCR_ROOT",  CFG_third_part / "PaddleOCR")
+# PaddleOCR 模型缓存目录（PP-OCRv4 mobile det/rec 等）
+CFG_PADDLEOCR_MODEL = env_or("PADDLEOCR_MODEL_DIR", Path("/mnt/workspace/lihaoran/ckps/paddleocr"))
 
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -380,13 +397,19 @@ QUALITY_FIELDS = [
 ]
 
 
-def process_segment(args, item, dover_state, aes_state, kvq_state):
-    """处理单个视频：质量评分。保留输入 CSV 全部列，追加质量评分结果。"""
+def process_segment(args, item, worker):
+    """处理单个视频：质量评分。短路求值: ocr -> dover -> aes -> kvq,
+    任一指标不达标立即终止, 后续模型不再运行; 失败原因写入 quality_reject_reason。
+
+    新增 reject reason 取值:
+      - ocr_subtitle_c{consistency}    帧一致性 >= 阈值, 判定有字幕
+      - ocr_subtitle_a{area_ratio}     字幕面积比超过 --max_subtitle_area_ratio
+      - ocr_error                      OCR 推理异常
+      - ocr_engine_missing             启用了 OCR 但引擎未初始化
+    """
     row = dict(item)
-    row["dover_overall"] = ""
-    row["aes_mean"] = ""
-    row["kvq_score"] = ""
-    row["quality_reject_reason"] = ""
+    for k in QUALITY_FIELDS:
+        row.setdefault(k, "")
 
     video_path = row.get(args.video_path_column, "")
     if not video_path or not Path(video_path).is_file():
@@ -394,46 +417,83 @@ def process_segment(args, item, dover_state, aes_state, kvq_state):
         return row
 
     print(f"  处理: {Path(video_path).name}")
+    reasons: List[str] = []
 
-    # DOVER
-    if dover_state:
-        d = dover_score(video_path, dover_state)
-        row["dover_overall"] = round(d["overall"], 6)
+    # ── 1) OCR（最便宜，放第一位；失败立即跳过后续三模型） ──
+    ocr_enabled = (not args.no_ocr) and CFG_USE_OCR
+    if ocr_enabled:
+        if worker.ocr_engine is None:
+            reasons.append("ocr_engine_missing")
+            row["quality_reject_reason"] = ",".join(reasons)
+            print(f"  不通过(OCR 引擎未就绪): {Path(video_path).name}")
+            return row
+        try:
+            from filter.filter_ocr import infer_video as ocr_infer_video
+            oc = ocr_infer_video(
+                worker.ocr_engine, video_path,
+                num_frames=args.ocr_frames, roi=worker.ocr_roi,
+            )
+            row["ocr_has_subtitle"]        = bool(oc["has_subtitle"])
+            row["ocr_subtitle_area_ratio"] = round(oc["subtitle_area_ratio"], 6)
+            row["ocr_frame_consistency"]   = round(oc["frame_consistency"], 6)
+            row["ocr_avg_text_area_ratio"] = round(oc["avg_text_area_ratio"], 6)
 
-    # Aesthetic Predictor V2.5
-    if aes_state:
-        a = aes_v25_score(video_path, aes_state, n_frames=args.aes_frames)
-        row["aes_mean"] = round(a["aes_mean"], 6)
-
-    # KVQ
-    if kvq_state:
-        k = kvq_score(video_path, kvq_state)
-        row["kvq_score"] = round(k["kvq_score"], 6)
-
-    # 质量判定
-    reasons = []
-    if args.min_dover_overall > 0 and dover_state:
-        if row["dover_overall"] and row["dover_overall"] < args.min_dover_overall:
-            reasons.append(f"dover_low_{row['dover_overall']}")
-    if args.min_aes_mean > 0 and aes_state:
-        if row["aes_mean"] and row["aes_mean"] < args.min_aes_mean:
-            reasons.append(f"aes_low_{row['aes_mean']}")
-    if args.min_kvq_score > 0 and kvq_state:
-        if row["kvq_score"] and row["kvq_score"] < args.min_kvq_score:
-            reasons.append(f"kvq_low_{row['kvq_score']}")
+            if oc["has_subtitle"] and oc["frame_consistency"] >= args.min_ocr_consistency:
+                reasons.append(f"ocr_subtitle_c{oc['frame_consistency']:.2f}")
+            elif (args.max_subtitle_area_ratio > 0
+                  and oc["subtitle_area_ratio"] > args.max_subtitle_area_ratio):
+                reasons.append(f"ocr_subtitle_a{oc['subtitle_area_ratio']:.4f}")
+        except Exception as e:
+            print(f"  [OCR] 推理失败: {e}")
+            row["ocr_has_subtitle"] = "ERR"
+            reasons.append("ocr_error")
 
     if reasons:
         row["quality_reject_reason"] = ",".join(reasons)
-        print(f"  不通过: {Path(video_path).name} | {', '.join(reasons)}")
+        print(f"  不通过(OCR): {Path(video_path).name} | {row['quality_reject_reason']}")
+        return row
+
+    # ── 2) DOVER ──
+    if worker.dover_state:
+        d = dover_score(video_path, worker.dover_state)
+        row["dover_overall"] = round(d["overall"], 6)
+        if args.min_dover_overall > 0 and row["dover_overall"] < args.min_dover_overall:
+            reasons.append(f"dover_low_{row['dover_overall']}")
+            row["quality_reject_reason"] = ",".join(reasons)
+            print(f"  不通过(DOVER): {Path(video_path).name}")
+            return row
+
+    # ── 3) AesV25 ──
+    if worker.aes_state:
+        a = aes_v25_score(video_path, worker.aes_state, n_frames=args.aes_frames)
+        row["aes_mean"] = round(a["aes_mean"], 6)
+        if args.min_aes_mean > 0 and row["aes_mean"] < args.min_aes_mean:
+            reasons.append(f"aes_low_{row['aes_mean']}")
+            row["quality_reject_reason"] = ",".join(reasons)
+            print(f"  不通过(AES): {Path(video_path).name}")
+            return row
+
+    # ── 4) KVQ ──
+    if worker.kvq_state:
+        k = kvq_score(video_path, worker.kvq_state)
+        row["kvq_score"] = round(k["kvq_score"], 6)
+        if args.min_kvq_score > 0 and row["kvq_score"] < args.min_kvq_score:
+            reasons.append(f"kvq_low_{row['kvq_score']}")
+            row["quality_reject_reason"] = ",".join(reasons)
+            print(f"  不通过(KVQ): {Path(video_path).name}")
+            return row
+
+    if reasons:
+        row["quality_reject_reason"] = ",".join(reasons)
     else:
         print(f"  通过: {Path(video_path).name}")
-
     return row
 
 
 # ─── Worker ─────────────────────────────────────────────────────────────────
 class Worker:
     def __init__(self):
+        worker_syspath_setup()  # Ray worker 端把 data_process/ 加进 sys.path
         self.output_dir = Path(args.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.all_csv = self.output_dir / "4_quality_all.csv"
@@ -446,6 +506,15 @@ class Worker:
             if not p.exists():
                 with open(p, "w", newline="", encoding="utf-8") as f:
                     csv.DictWriter(f, fieldnames=self.fieldnames).writeheader()
+        # 断点续跑：加载已处理的 video_path（输入行里 video_path 字段是源视频路径）
+        self.processed = set()
+        if self.all_csv.exists():
+            with open(self.all_csv, encoding="utf-8") as f:
+                for r in csv.DictReader(f):
+                    vp = r.get("video_path", "")
+                    if vp:
+                        self.processed.add(vp)
+        print(f"Worker: 已处理 {len(self.processed)} 条。")
         # 路径初始化
         _update_roots(args.third_part)
         # 加载模型
@@ -460,7 +529,34 @@ class Worker:
         self.kvq_state = None if args.no_kvq else load_kvq(
             device, args.kvq_cfg, args.kvq_weight
         )
+        # OCR 引擎（懒加载：首次 __call__ 时才创建, 避免 Ray Actor 启动期 fork Paddle 崩溃）
+        self.ocr_engine = None
+        self.ocr_roi    = None
+        if not args.no_ocr and CFG_USE_OCR:
+            if not CFG_PADDLEOCR_ROOT.exists():
+                print(f"[OCR] PaddleOCR 路径不存在: {CFG_PADDLEOCR_ROOT}, 跳过")
+            else:
+                os.environ.setdefault("PADDLEOCR_ROOT",       str(CFG_PADDLEOCR_ROOT))
+                os.environ.setdefault("PADDLEOCR_MODEL_DIR",  str(CFG_PADDLEOCR_MODEL))
+                os.environ.setdefault("OMP_NUM_THREADS",      "1")
+                os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+                print(f"[OCR] 已就绪(懒加载)  root={CFG_PADDLEOCR_ROOT}  model={CFG_PADDLEOCR_MODEL}")
         print("质量评估模型加载完成")
+
+    def _ensure_ocr_engine(self):
+        """首次需要 OCR 时再创建引擎。"""
+        if self.ocr_engine is not None:
+            return
+        from filter.filter_ocr import (
+            create_ocr_engine, setup_paddle_env, get_roi, PADDLEOCR_ROOT,
+        )
+        setup_paddle_env()
+        self.ocr_engine = create_ocr_engine(
+            lang=args.ocr_lang, ocr_version=args.ocr_version, device=args.ocr_device,
+        )
+        self.ocr_roi = get_roi(mode=args.ocr_mode, roi_str=args.ocr_roi)
+        print(f"[OCR] 引擎就绪  version={args.ocr_version} lang={args.ocr_lang} "
+              f"roi={self.ocr_roi} frames={args.ocr_frames}")
 
     def _append_csv(self, filepath, row):
         with open(filepath, "a", newline="", encoding="utf-8") as f:
@@ -475,17 +571,29 @@ class Worker:
             row = dict(item)
             row.update({k: "" for k in QUALITY_FIELDS})
             return row
-        row = process_segment(args, item, self.dover_state, self.aes_state, self.kvq_state)
+        if video_path in self.processed:
+            row = dict(item)
+            row.update({k: "" for k in QUALITY_FIELDS})
+            return row
+        # 懒加载 OCR 引擎
+        if (not args.no_ocr) and CFG_USE_OCR and self.ocr_engine is None \
+                and CFG_PADDLEOCR_ROOT.exists():
+            try:
+                self._ensure_ocr_engine()
+            except Exception as e:
+                print(f"  [OCR] 引擎初始化失败: {e}")
+        row = process_segment(args, item, self)
         self._append_csv(self.all_csv, row)
         if not row.get("quality_reject_reason"):
             self._append_csv(self.qual_csv, row)
+        self.processed.add(video_path)
         return row
 
 
 # ─── CLI ─────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser(description="视频质量三模型集成评估 Pipeline")
-parser.add_argument("--input_csv", default="/mnt/workspace/lihaoran/data_process/test/result/0612/motion_filter_raft/data_5000_all_last/motion_filter_qualified.csv")
-parser.add_argument("--output_dir", default="/mnt/workspace/lihaoran/data_process/test/result/0612/quality_filter/data_5000_all_last/")
+parser.add_argument("--input_csv", default="/mnt/workspace/lihaoran/data_process/test/result/0617/motion_filter_raft/data_5000_all/3_motion_filter_qualified.csv")
+parser.add_argument("--output_dir", default="/mnt/workspace/lihaoran/data_process/test/result/0617/quality_filter/data_5000_all")
 parser.add_argument("--video_path_column", default="video_path")
 parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 
@@ -493,6 +601,7 @@ parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else
 parser.add_argument("--no-dover", action="store_true")
 parser.add_argument("--no-aes", action="store_true")
 parser.add_argument("--no-kvq", action="store_true")
+parser.add_argument("--no-ocr", action="store_true")
 
 # third_part 总目录
 parser.add_argument("--third-part", default=str(CFG_third_part))
@@ -506,20 +615,31 @@ parser.add_argument("--aes-weight", default=str(CFG_AES_WEIGHT))
 parser.add_argument("--aes-encoder", default=CFG_AES_ENCODER)
 parser.add_argument("--aes-frames", type=int, default=16)
 
+
 # KVQ
 parser.add_argument("--kvq-cfg", default=str(CFG_KVQ_CFG))
 parser.add_argument("--kvq-weight", default=str(CFG_KVQ_WEIGHT))
 
+# OCR (PaddleOCR)
+parser.add_argument("--ocr-version", default="PP-OCRv4", choices=["PP-OCRv4", "PP-OCRv5"])
+parser.add_argument("--ocr-lang",    default="ch",choices=["ch", "en"])
+parser.add_argument("--ocr-device",  default="cpu",)
+parser.add_argument("--ocr-frames",  type=int, default=21)
+parser.add_argument("--ocr-mode",    default="full",choices=["full","subtitle","subtitle_slim","watermark_top","watermark_br","watermark_bl","center","top_half","bottom_half"])
+parser.add_argument("--ocr-roi",     default=None,help="自定义 ROI: 'x1,y1,x2,y2' (比例或像素), 覆盖 --ocr-mode")
+parser.add_argument("--min_ocr_consistency",       type=float, default=0.5,help="字幕帧一致性下限, >= 则视为有字幕")
+parser.add_argument("--max_subtitle_area_ratio",   type=float, default=0.0,help="过滤后字幕面积均值上限, >0 时启用; 0 表示不按面积过滤")
+
 # 质量阈值（默认 0 表示不过滤）
-parser.add_argument("--min_dover_overall", type=float, default=0.3)
+parser.add_argument("--min_dover_overall", type=float, default=0.4)
 parser.add_argument("--min_aes_mean", type=float, default=4.2)
 parser.add_argument("--min_kvq_score", type=float, default=0.008)
 
 # Ray
 parser.add_argument("--ray", action="store_true", help="启用 Ray 分布式模式")
-parser.add_argument("--ray_num_gpus", type=float, default=0.5)
-parser.add_argument("--ray_num_cpus", type=float, default=0)
-parser.add_argument("--concurrency", type=int, default=4)
+parser.add_argument("--ray_num_gpus", type=float, default=0.2)
+parser.add_argument("--ray_num_cpus", type=float, default=2)
+parser.add_argument("--concurrency", type=int, default=10)
 args = parser.parse_args()
 
 
@@ -547,13 +667,22 @@ if __name__ == "__main__":
     else:
         # ── Ray 分布式模式 ──
         import ray
-        ray.init(address="auto")
-        samples = ray.data.read_csv(deduped_csv)
+        ray.init(address="auto",
+                 runtime_env={"env_vars":
+                                {"PYTHONPATH": str(_FILTER_ROOT),
+                                 "DATA_PROCESS_ROOT": str(_FILTER_ROOT)},
+                            }
+                )
+        from ray.data import ActorPoolStrategy
+        samples = ray.data.read_csv(deduped_csv).materialize()
+        target_parallelism = min(args.concurrency, samples.count())
+        if samples.num_blocks() < target_parallelism:
+            samples = samples.repartition(target_parallelism)
         predictions = samples.map(
             Worker,
             num_gpus=args.ray_num_gpus,
-            num_cpus=args.ray_num_cpus,
-            concurrency=args.concurrency,
+            num_cpus=max(args.ray_num_cpus, 1),
+            compute=ActorPoolStrategy(size=target_parallelism),
         )
         predictions.take_all()
         print("Ray 完成")

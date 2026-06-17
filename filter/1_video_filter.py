@@ -19,7 +19,13 @@ import json
 import shutil
 import subprocess
 from pathlib import Path
+import sys
 
+_FILTER_ROOT = Path(__file__).resolve().parents[1]
+if str(_FILTER_ROOT) not in sys.path:
+    sys.path.insert(0, str(_FILTER_ROOT))
+
+from filter.filter_utils import unique_output_name, worker_syspath_setup
 
 # ─── ffprobe ─────────────────────────────────────────────────────────────────
 
@@ -170,7 +176,7 @@ def transcode_video(input_path, output_path,
 # ─── CSV 字段 ────────────────────────────────────────────────────────────────
 
 FIELDNAMES = [
-    "source_video_path", "video_path",
+    "video_path",
     "video_filter_reject_reason",
     "resolution", "source_fps", "source_audio_sample_rate", "source_bitrate",
     "duration", "was_transcoded",
@@ -181,7 +187,6 @@ FIELDNAMES = [
 def process_segment(args, video_path, qualified_dir):
     """处理单个视频：质量检查 + 必要时转码。返回 CSV row dict。"""
     row = {
-        "source_video_path": str(video_path),
         "video_path": "",
         "video_filter_reject_reason": "",
         "resolution": "",
@@ -242,7 +247,7 @@ def process_segment(args, video_path, qualified_dir):
     need_audio = parsed["audio_sample_rate"] != args.target_audio_sr
 
     if need_fps or need_audio:
-        out_name = f"{seg_path.stem}_25fps.mp4"
+        out_name = unique_output_name(video_path, suffix=".mp4")
         out_path = Path(qualified_dir) / out_name
 
         # 已存在则校验有效性（ffprobe 能否打开），损坏文件直接删除重新转码
@@ -276,7 +281,7 @@ def process_segment(args, video_path, qualified_dir):
         row["was_transcoded"] = True
     else:
         # 无需转码，symlink / copy / 原路径
-        out_name = seg_path.name
+        out_name = unique_output_name(video_path, suffix=".mp4")
         out_path = Path(qualified_dir) / out_name
 
         # 已存在则跳过
@@ -301,6 +306,7 @@ def process_segment(args, video_path, qualified_dir):
 
 class Worker:
     def __init__(self):
+        worker_syspath_setup()  # Ray worker 端把 data_process/ 加进 sys.path
         self.output_dir = Path(args.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.qualified_dir = self.output_dir / "qualified_videos"
@@ -311,6 +317,15 @@ class Worker:
             if not p.exists():
                 with open(p, "w", newline="", encoding="utf-8") as f:
                     csv.DictWriter(f, fieldnames=FIELDNAMES).writeheader()
+        # 断点续跑：加载已处理的 video_path
+        self.processed = set()
+        if self.all_csv.exists():
+            with open(self.all_csv, encoding="utf-8") as f:
+                for r in csv.DictReader(f):
+                    vp = r.get("video_path", "")
+                    if vp:
+                        self.processed.add(vp)
+        print(f"Worker initialized. 已处理 {len(self.processed)} 条。")
 
     def _append_csv(self, filepath, row):
         with open(filepath, "a", newline="", encoding="utf-8") as f:
@@ -323,20 +338,23 @@ class Worker:
         video_path = item.get(args.video_path_column, "")
         if not video_path:
             return {k: "" for k in FIELDNAMES}
+        if video_path in self.processed:
+            return {k: "" for k in FIELDNAMES}
         row = process_segment(args, video_path, str(self.qualified_dir))
         self._append_csv(self.all_csv, row)
         if not row.get("video_filter_reject_reason"):
             self._append_csv(self.qual_csv, row)
+        self.processed.add(video_path)
         return row
 
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser(description="视频质量过滤 + FPS/音频采样率标准化转码")
-parser.add_argument("--input_csv", default="/mnt/workspace/lihaoran/data_process/test_data/data_5000_all.csv")
-parser.add_argument("--output_dir", default="/mnt/workspace/lihaoran/data_process/test/result/0612/video_filter/data_5000_all_last_testray/")
+parser.add_argument("--input_csv", default="/mnt/workspace/lihaoran/data_process/test/result/0616/data_5000_last/input_videos_deduped.csv")
+parser.add_argument("--output_dir", default="/mnt/workspace/lihaoran/data_process/test/result/0617/video_filter/data_5000_all/")
 parser.add_argument("--video_path_column", default="video_path")
 parser.add_argument("--min_resolution", default="1080p")
-parser.add_argument("--min_duration", type=int, default=81)
+parser.add_argument("--min_duration", type=int, default=121)
 parser.add_argument("--max_duration", type=int, default=0)
 parser.add_argument("--target_fps", type=int, default=25)
 parser.add_argument("--target_audio_sr", type=int, default=48000)
@@ -345,8 +363,8 @@ parser.add_argument("--copy_mode", choices=["symlink", "copy", "none"], default=
 # Ray
 parser.add_argument("--ray", action="store_true", help="启用 Ray 分布式模式")
 parser.add_argument("--ray_num_gpus", type=float, default=0.0)
-parser.add_argument("--ray_num_cpus", type=float, default=4)
-parser.add_argument("--concurrency", type=int, default=22)
+parser.add_argument("--ray_num_cpus", type=float, default=1)
+parser.add_argument("--concurrency", type=int, default=24)
 args = parser.parse_args()
 
 
@@ -378,12 +396,16 @@ if __name__ == "__main__":
         # ── Ray 分布式模式 ──
         import ray
         ray.init(address="auto")
-        samples = ray.data.read_csv(deduped_csv)
+        from ray.data import ActorPoolStrategy
+        samples = ray.data.read_csv(deduped_csv).materialize()
+        target_parallelism = min(args.concurrency, samples.count())
+        if samples.num_blocks() < target_parallelism:
+            samples = samples.repartition(target_parallelism)
         predictions = samples.map(
             Worker,
             num_gpus=args.ray_num_gpus,
-            num_cpus=args.ray_num_cpus,
-            concurrency=args.concurrency,
+            num_cpus=max(args.ray_num_cpus, 1),
+            compute=ActorPoolStrategy(size=target_parallelism),
         )
         predictions.take_all()
         print("Ray 完成")

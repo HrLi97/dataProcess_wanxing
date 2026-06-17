@@ -31,3 +31,6 @@
 [submodule "third_part/Music-Source-Separation-Training"]
 	path = third_part/Music-Source-Separation-Training
 	url = https://github.com/ZFTurbo/Music-Source-Separation-Training.git
+[submodule "third_part/PaddleOCR"]
+	path = third_part/PaddleOCR
+	url = https://github.com/PaddlePaddle/PaddleOCR.git
