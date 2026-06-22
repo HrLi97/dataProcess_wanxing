@@ -30,7 +30,6 @@ from filter.filter_utils import (
 
 LIPSYNC_FIELDS = [
     "lipsync_reject_reason",
-    "semantic_score",
 ]
 
 
@@ -39,8 +38,8 @@ from filter.model_runner import (
     TalkNCEWorker,
     SyncNetWorker,
     AudioEnhanceWorker,
-    SemanticSyncWorker,
 )
+from filter.obs_helper import add_obs_args, ObsIO
 from filter.model_runner.pyannote_diarization import PyannoteDiarizationWorker
 from filter.model_runner.face_speaker_match import match_faces_to_speakers
 
@@ -55,7 +54,6 @@ def process_segment(
     syncnet_worker,
     qualified_dir,
     audio_enhance_worker=None,
-    semantic_sync_worker=None,
 ):
     """处理单个视频片段的唇形同步检测。保留输入 CSV 全部列，追加 lipsync 结果。"""
     row = dict(item)
@@ -63,9 +61,6 @@ def process_segment(
     # 不再保留 source_video_path：当前处理视频的路径就是 segment_path。
     row["video_path"] = ""
     row["lipsync_reject_reason"] = ""
-    row["semantic_score"] = ""
-    row["is_semantically_synced"] = ""
-    row["semantic_status"] = ""
 
     if not segment_path or not Path(segment_path).is_file():
         row["lipsync_reject_reason"] = "missing_segment"
@@ -88,6 +83,7 @@ def process_segment(
     diarization = {"status": "disabled", "speakers": []}
     diarize_input = enhanced_audio_path if enhanced_audio_path else processing_video_path
     diarization = pyannote_worker.diarize(diarize_input)
+    print(f"[PyAnnote] Diarization: {diarization}")
 
     # ── Step 2: InsightFace Tracking ─────────────────────────────────────────
     face_result = tracker.extract_tracks(
@@ -200,37 +196,21 @@ def process_segment(
 
         primary_tr = next((t for t in face_tracks if t["track_id"] == primary_tr_id), None)
 
-        # ── 语义同步（必经流程） ─────────────────────────────────────────────
-        semantic_score = None
-        semantic_status = "skipped"
-        sem_result = {"is_semantically_synced": False}
-        if semantic_sync_worker is not None:
-            sem_result = semantic_sync_worker.score(
-                processing_video_path, enhanced_audio_path
-            )
-            semantic_score = sem_result.get("semantic_score")
-            semantic_status = sem_result.get("status", "unknown")
-            print(f"  [SemanticSync] score={semantic_score}, status={semantic_status}")
-
-        semantic_passed = sem_result.get("is_semantically_synced", False)
-
-        row["semantic_score"] = "" if semantic_score is None else semantic_score
-
         # ── 判定逻辑 ──────────────────────────────────────────────────────────
-        # 有 speaking face 存在 → 必须选它，同时语义同步也必须通过
-        # 没有 speaking face → 退化到语义同步兜底判断
+        # 多说话人路径：PyAnnote 已检测到人声 → SyncNet 做判定
         has_speaking = primary_info and primary_info.get("sync_is_speaking")
+        has_face = face_result.get("num_face_tracks", 0) > 0
 
         reject_reasons = []
-        if has_speaking:
-            # 有说话人：语义同步必须通过
-            if not semantic_passed:
-                reject_reasons.append("semantic_not_synced")
+        if has_face and has_speaking:
+            # 有脸 + SyncNet 唇音同步通过 → PASS
+            pass
+        elif has_face and not has_speaking:
+            # 有脸但 SyncNet 不通过（唇不动/不同步/场外人说话） → REJECT
+            reject_reasons.append("sync_failed")
         else:
-            # 无说话人：语义同步兜底
-            reject_reasons.append("target_not_speaking")
-            if not semantic_passed:
-                reject_reasons.append("semantic_not_synced")
+            # 无脸但有人声 → REJECT
+            reject_reasons.append("no_face_with_speech")
 
         if reject_reasons:
             row["lipsync_reject_reason"] = ",".join(reject_reasons)
@@ -267,39 +247,25 @@ def process_segment(
         (t for t in face_compact["tracks"] if t["track_id"] == primary_id), None
     )
 
-    # ── 语义同步（必经流程） ────────────────────────────────────────────────
-    semantic_score = None
-    semantic_status = "skipped"
-    sem_result = {"is_semantically_synced": False}
-    if semantic_sync_worker is not None:
-        sem_result = semantic_sync_worker.score(
-            processing_video_path, enhanced_audio_path
-        )
-        semantic_score = sem_result.get("semantic_score")
-        semantic_status = sem_result.get("status", "unknown")
-        print(f"  [SemanticSync] score={semantic_score}, status={semantic_status}")
-
-    semantic_passed = sem_result.get("is_semantically_synced", False)
-
-    row["semantic_score"] = "" if semantic_score is None else semantic_score
-
-    # 判定：有说话人 → 必须选 + 语义必须通过；无说话人 → 语义兜底
+    # 判定逻辑
     reasons = []
     has_face = face_result.get("num_face_tracks", 0) > 0
+    has_speech = len(diarization.get("speakers", [])) > 0
 
-    if has_face and syncnet_spoke:
-        # 有说话人：语义同步必须通过
-        if not semantic_passed:
-            reasons.append("semantic_not_synced")
-    elif has_face and not syncnet_spoke:
-        # 有脸但没在说话：语义兜底
-        reasons.append("target_not_speaking")
-        if not semantic_passed:
-            reasons.append("semantic_not_synced")
+    if has_speech:
+        # 有人声 → SyncNet 做判定
+        if has_face and syncnet_spoke:
+            # 有脸 + SyncNet 唇音同步通过 → PASS
+            pass
+        elif has_face and not syncnet_spoke:
+            # 有脸但 SyncNet 不通过（场外人说话/唇不同步） → REJECT
+            reasons.append("sync_failed")
+        else:
+            # 无脸但有人声 → REJECT
+            reasons.append("no_face_with_speech")
     else:
-        # 无脸：仅语义同步兜底
-        if not semantic_passed:
-            reasons.append("semantic_not_synced")
+        # 无人声无脸 → 直接通过（风景/音乐类视频）
+        pass
 
     if reasons:
         row["lipsync_reject_reason"] = ",".join(reasons)
@@ -335,7 +301,6 @@ class Worker:
         self.talknce_worker = TalkNCEWorker(args)
         self.syncnet_worker = SyncNetWorker(args)
         self.audio_enhance_worker = AudioEnhanceWorker(args)
-        self.semantic_sync_worker = SemanticSyncWorker(args)
         # 初始化 CSV
         self.all_csv = str(Path(args.output_dir) / "5_lipsync_all.csv")
         self.qual_csv = str(Path(args.output_dir) / "5_lipsync_qualified.csv")
@@ -356,7 +321,9 @@ class Worker:
                     sv = r.get("video_path", "")
                     if sv:
                         self.processed.add(sv)
-        print(f"Worker initialized: lipsync models loaded. 已处理 {len(self.processed)} 条。")
+        # OBS
+        self.obs_io = ObsIO(args)
+        print(f"Worker initialized: lipsync models loaded. OBS={self.obs_io.enabled}. 已处理 {len(self.processed)} 条。")
 
     def _append_csv(self, filepath, row):
         with open(filepath, "a", newline="", encoding="utf-8") as f:
@@ -375,20 +342,51 @@ class Worker:
             skip_row.setdefault("video_path", "")
             skip_row["lipsync_reject_reason"] = "already_processed"
             return skip_row
-        print(f"[{time.strftime('%H:%M:%S')}] lipsync: {vid_path}", flush=True)
-        row = process_segment(
-            args, item,
-            self.tracker, self.pyannote_worker,
-            self.talknce_worker, self.syncnet_worker,
-            str(self.qualified_dir),
-            audio_enhance_worker=self.audio_enhance_worker,
-            semantic_sync_worker=self.semantic_sync_worker,
-        )
-        self._append_csv(self.all_csv, row)
-        if not row.get("lipsync_reject_reason"):
-            self._append_csv(self.qual_csv, row)
-        self.processed.add(vid_path)
-        return row
+
+        local_video = None
+        try:
+            # ── OBS: 下载视频 ──
+            if self.obs_io.enabled:
+                local_video = self.obs_io.download(vid_path)
+                item = dict(item)
+                item[args.video_path_column] = local_video
+            else:
+                local_video = vid_path
+
+            print(f"[{time.strftime('%H:%M:%S')}] lipsync: {vid_path}", flush=True)
+            row = process_segment(
+                args, item,
+                self.tracker, self.pyannote_worker,
+                self.talknce_worker, self.syncnet_worker,
+                str(self.qualified_dir),
+                audio_enhance_worker=self.audio_enhance_worker,
+            )
+
+            # ── OBS: 上传合格视频，CSV 写 obs_key ──
+            if self.obs_io.enabled and not row.get("lipsync_reject_reason"):
+                local_result = row.get("video_path", "")
+                if local_result and Path(local_result).is_file():
+                    obs_key = self.obs_io.make_obs_key(
+                        "qualified_videos", Path(local_result).name
+                    )
+                    self.obs_io.upload(local_result, obs_key)
+                    row["video_path"] = obs_key
+                    self.obs_io.cleanup(local_result)
+
+            self._append_csv(self.all_csv, row)
+            if not row.get("lipsync_reject_reason"):
+                self._append_csv(self.qual_csv, row)
+            self.processed.add(vid_path)
+            return row
+        finally:
+            # ── OBS: 清理下载的临时文件 + enhanced audio ──
+            if self.obs_io.enabled and local_video and local_video != vid_path:
+                self.obs_io.cleanup(local_video)
+            if self.obs_io.enabled:
+                enhanced_dir = Path(args.output_dir) / "enhanced_audio"
+                if enhanced_dir.exists():
+                    import shutil
+                    shutil.rmtree(enhanced_dir, ignore_errors=True)
 
 
 # ─── CLI ─────
@@ -396,9 +394,8 @@ parser = argparse.ArgumentParser(
     description="唇形同步筛选：InsightFace + SyncNet + PyAnnote + SemanticSync"
 )
 # Paths
-parser.add_argument("--input_csv", default=str(project_root() / "test" / "result" / "0612" / "motion_filter_raft" / "data_5000_all_last" / "motion_filter_qualified.csv"),
-                    help="输入 CSV（通常为 cutshot_qualified.csv）")
-parser.add_argument("--output_dir", default=str(project_root() / "test" / "result" / "0612" / "filter_lipsync" / "data_5000_all_last" / ""))
+parser.add_argument("--input_csv", default="/mnt/workspace/lihaoran/data_process/test/result/0618/motion_filter_raft/data_5no_pepole000_all/3_motion_filter_qualified.csv")
+parser.add_argument("--output_dir", default="/mnt/workspace/lihaoran/data_process/test/result/0622/lipsync_filter/no_pepole/")
 parser.add_argument("--video_path_column", default="video_path", help="输入 CSV 中视频路径列名")
 parser.add_argument("--device", default="cuda:0")
 
@@ -424,9 +421,9 @@ parser.add_argument("--disable_talknce", action="store_true")
 parser.add_argument("--syncnet_ckpt", default=str(env_or("SYNCNET_CKPT", project_root() / "third_part" / "syncnet" / "syncnet_v2.model")))
 parser.add_argument("--syncnet_vshift", type=int, default=10)
 parser.add_argument("--syncnet_batch_size", type=int, default=20)
-parser.add_argument("--syncnet_min_confidence", type=float, default=1.0)
-parser.add_argument("--syncnet_min_offset", type=int, default=-6)
-parser.add_argument("--syncnet_max_offset", type=int, default=6)
+parser.add_argument("--syncnet_min_confidence", type=float, default=0.8)
+parser.add_argument("--syncnet_min_offset", type=int, default=-7)
+parser.add_argument("--syncnet_max_offset", type=int, default=7)
 parser.add_argument("--syncnet_crop_scale", type=float, default=0.40)
 parser.add_argument("--disable_syncnet", action="store_true")
 
@@ -448,10 +445,10 @@ parser.add_argument("--audio_sep_ckpt",
                                        project_root() / "third_part" / "Music-Source-Separation-Training" / "ckpts" / "MelBandRoformer.ckpt")))
 parser.add_argument("--audio_sep_tta", action="store_true")
 
-# Semantic Sync (ImageBind)
-parser.add_argument("--disable_semantic_sync", action="store_true")
-parser.add_argument("--semantic_sync_threshold", type=float, default=0.25)
-parser.add_argument("--semantic_sync_max_frames", type=int, default=15)
+# Semantic Sync (ImageBind) - disabled
+# parser.add_argument("--disable_semantic_sync", action="store_true")
+# parser.add_argument("--semantic_sync_threshold", type=float, default=0.25)
+# parser.add_argument("--semantic_sync_max_frames", type=int, default=15)
 
 # Decision
 parser.add_argument("--allow_non_target_speaker", action="store_true")
@@ -460,12 +457,15 @@ parser.add_argument("--allow_non_target_speaker", action="store_true")
 parser.add_argument("--qualified_copy_mode", choices=["symlink", "copy", "none"], default="symlink")
 parser.add_argument("--use_source_audio_segments", action="store_true", default=True)
 
+# OBS
+add_obs_args(parser)
+
 # Ray
 parser.add_argument("--ray", action="store_true", help="启用 Ray 分布式模式")
 parser.add_argument("--ray_address", default="auto")
-parser.add_argument("--ray_num_gpus", type=float, default=1.0)
-parser.add_argument("--ray_num_cpus", type=float, default=0.0)
-parser.add_argument("--concurrency", type=int, default=1)
+parser.add_argument("--ray_num_gpus", type=float, default=0.5)
+parser.add_argument("--ray_num_cpus", type=float, default=4)
+parser.add_argument("--concurrency", type=int, default=4)
 
 args = parser.parse_args()
 
@@ -522,7 +522,9 @@ if __name__ == "__main__":
         # ── Ray 分布式模式 ──
         import ray
         ray_init_kwargs = {
-            "runtime_env": {"env_vars": {"PYTHONPATH": str(PROJECT_ROOT)}}
+            "runtime_env": {"env_vars": {
+                "PYTHONPATH": str(PROJECT_ROOT),
+            }}
         }
         if args.ray_address:
             ray_init_kwargs["address"] = args.ray_address
@@ -532,6 +534,7 @@ if __name__ == "__main__":
         target_parallelism = min(args.concurrency, samples.count())
         if samples.num_blocks() < target_parallelism:
             samples = samples.repartition(target_parallelism)
+            
         predictions = samples.map(
             Worker,
             num_gpus=args.ray_num_gpus,

@@ -20,6 +20,7 @@ if str(_FILTER_ROOT) not in sys.path:
     sys.path.insert(0, str(_FILTER_ROOT))
 
 from filter.filter_utils import project_root, ckps_root, env_or, worker_syspath_setup  # noqa: E402
+from filter.obs_helper import add_obs_args, ObsIO  # noqa: E402
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -541,7 +542,9 @@ class Worker:
                 os.environ.setdefault("OMP_NUM_THREADS",      "1")
                 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
                 print(f"[OCR] 已就绪(懒加载)  root={CFG_PADDLEOCR_ROOT}  model={CFG_PADDLEOCR_MODEL}")
-        print("质量评估模型加载完成")
+        # OBS
+        self.obs_io = ObsIO(args)
+        print(f"质量评估模型加载完成. OBS={self.obs_io.enabled}")
 
     def _ensure_ocr_engine(self):
         """首次需要 OCR 时再创建引擎。"""
@@ -582,18 +585,38 @@ class Worker:
                 self._ensure_ocr_engine()
             except Exception as e:
                 print(f"  [OCR] 引擎初始化失败: {e}")
-        row = process_segment(args, item, self)
-        self._append_csv(self.all_csv, row)
-        if not row.get("quality_reject_reason"):
-            self._append_csv(self.qual_csv, row)
-        self.processed.add(video_path)
-        return row
+
+        local_video = None
+        try:
+            # ── OBS: 下载视频用于质量评分 ──
+            if self.obs_io.enabled:
+                local_video = self.obs_io.download(video_path)
+                item = dict(item)
+                item[args.video_path_column] = local_video
+            else:
+                local_video = video_path
+
+            row = process_segment(args, item, self)
+
+            # ── OBS: video_path 保持为 obs_key（不产出新视频，只打分） ──
+            if self.obs_io.enabled and not row.get("quality_reject_reason"):
+                row["video_path"] = video_path  # 恢复为 obs_key
+
+            self._append_csv(self.all_csv, row)
+            if not row.get("quality_reject_reason"):
+                self._append_csv(self.qual_csv, row)
+            self.processed.add(video_path)
+            return row
+        finally:
+            # ── OBS: 清理下载的临时文件 ──
+            if self.obs_io.enabled and local_video and local_video != video_path:
+                self.obs_io.cleanup(local_video)
 
 
 # ─── CLI ─────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser(description="视频质量三模型集成评估 Pipeline")
-parser.add_argument("--input_csv", default="/mnt/workspace/lihaoran/data_process/test/result/0617/motion_filter_raft/data_5000_all/3_motion_filter_qualified.csv")
-parser.add_argument("--output_dir", default="/mnt/workspace/lihaoran/data_process/test/result/0617/quality_filter/data_5000_all")
+parser.add_argument("--input_csv", default="/mnt/workspace/lihaoran/data_process/test/result/0618/motion_filter_raft/data_5no_pepole000_all/3_motion_filter_qualified.csv")
+parser.add_argument("--output_dir", default="/mnt/workspace/lihaoran/data_process/test/result/0618/quality_filter/no_pepole")
 parser.add_argument("--video_path_column", default="video_path")
 parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 
@@ -634,6 +657,9 @@ parser.add_argument("--max_subtitle_area_ratio",   type=float, default=0.0,help=
 parser.add_argument("--min_dover_overall", type=float, default=0.4)
 parser.add_argument("--min_aes_mean", type=float, default=4.2)
 parser.add_argument("--min_kvq_score", type=float, default=0.008)
+
+# OBS
+add_obs_args(parser)
 
 # Ray
 parser.add_argument("--ray", action="store_true", help="启用 Ray 分布式模式")

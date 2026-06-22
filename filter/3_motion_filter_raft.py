@@ -21,6 +21,7 @@ if _FILTER_ROOT not in sys.path:
     sys.path.insert(0, _FILTER_ROOT)
 
 from filter.filter_utils import unique_output_name, worker_syspath_setup
+from filter.obs_helper import add_obs_args, ObsIO
 
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -811,7 +812,9 @@ class Worker:
                         self.processed.add(vp)
         print(f"加载 RAFT 模型: {args.raft_model}")
         self.model = load_raft_model(args.raft_model, small=args.raft_small)
-        print(f"RAFT 模型加载完成. 已处理 {len(self.processed)} 条。")
+        # OBS
+        self.obs_io = ObsIO(args)
+        print(f"RAFT 模型加载完成. OBS={self.obs_io.enabled}. 已处理 {len(self.processed)} 条。")
 
     def _append_csv(self, filepath, row):
         with open(filepath, "a", newline="", encoding="utf-8") as f:
@@ -830,18 +833,45 @@ class Worker:
             row = dict(item)
             row.update({k: "" for k in MOTION_FIELDS})
             return row
-        row = process_segment(args, self.model, item, str(self.qualified_dir))
-        self._append_csv(self.all_csv, row)
-        if not row.get("motion_reject_reason"):
-            self._append_csv(self.qual_csv, row)
-        self.processed.add(seg_path)
-        return row
+
+        local_video = None
+        try:
+            # ── OBS: 下载视频 ──
+            if self.obs_io.enabled:
+                local_video = self.obs_io.download(seg_path)
+                item = dict(item)
+                item[args.video_path_column] = local_video
+            else:
+                local_video = seg_path
+
+            row = process_segment(args, self.model, item, str(self.qualified_dir))
+
+            # ── OBS: 上传合格视频，CSV 写 obs_key ──
+            if self.obs_io.enabled and not row.get("motion_reject_reason"):
+                local_result = row.get("video_path", "")
+                if local_result and Path(local_result).is_file():
+                    obs_key = self.obs_io.make_obs_key(
+                        "qualified_videos", Path(local_result).name
+                    )
+                    self.obs_io.upload(local_result, obs_key)
+                    row["video_path"] = obs_key
+                    self.obs_io.cleanup(local_result)
+
+            self._append_csv(self.all_csv, row)
+            if not row.get("motion_reject_reason"):
+                self._append_csv(self.qual_csv, row)
+            self.processed.add(seg_path)
+            return row
+        finally:
+            # ── OBS: 清理下载的临时文件 ──
+            if self.obs_io.enabled and local_video and local_video != seg_path:
+                self.obs_io.cleanup(local_video)
 
 # ─── CLI ─────────────────────────────────────────────────────────────────
 RAFT_CKPT_DEFAULT = str(Path(__file__).resolve().parent.parent / "third_part" / "raft-things.pth")
 parser = argparse.ArgumentParser(description="RAFT 光流运动评分过滤")
-parser.add_argument("--input_csv", default="/mnt/workspace/lihaoran/data_process/test/result/0617/filter_shotcut/data_5000_all/2_cutshot_qualified.csv")
-parser.add_argument("--output_dir", default="/mnt/workspace/lihaoran/data_process/test/result/0617/motion_filter_raft/data_5000_all/")
+parser.add_argument("--input_csv", default="/mnt/workspace/lihaoran/data_process/test/result/0618/filter_shotcut/no_pepole/2_cutshot_qualified.csv")
+parser.add_argument("--output_dir", default="/mnt/workspace/lihaoran/data_process/test/result/0618/motion_filter_raft/data_5no_pepole000_all/")
 parser.add_argument("--video_path_column", default="video_path")
 parser.add_argument("--raft_model", default=RAFT_CKPT_DEFAULT)
 parser.add_argument("--raft_small", action="store_true")
@@ -851,6 +881,9 @@ parser.add_argument("--max_motion", type=float, default=200)
 parser.add_argument("--sampling_fps", type=int, default=2)
 parser.add_argument("--max_size", type=int, default=512)
 parser.add_argument("--copy_mode", choices=["symlink", "copy", "none"], default="symlink")
+
+# OBS
+add_obs_args(parser)
 
 # Ray
 parser.add_argument("--ray", action="store_true", help="启用 Ray 分布式模式")

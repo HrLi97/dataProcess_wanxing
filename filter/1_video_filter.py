@@ -26,6 +26,7 @@ if str(_FILTER_ROOT) not in sys.path:
     sys.path.insert(0, str(_FILTER_ROOT))
 
 from filter.filter_utils import unique_output_name, worker_syspath_setup
+from filter.obs_helper import add_obs_args, ObsIO
 
 # ─── ffprobe ─────────────────────────────────────────────────────────────────
 
@@ -325,7 +326,9 @@ class Worker:
                     vp = r.get("video_path", "")
                     if vp:
                         self.processed.add(vp)
-        print(f"Worker initialized. 已处理 {len(self.processed)} 条。")
+        # OBS
+        self.obs_io = ObsIO(args)
+        print(f"Worker initialized. OBS={self.obs_io.enabled}. 已处理 {len(self.processed)} 条。")
 
     def _append_csv(self, filepath, row):
         with open(filepath, "a", newline="", encoding="utf-8") as f:
@@ -340,18 +343,44 @@ class Worker:
             return {k: "" for k in FIELDNAMES}
         if video_path in self.processed:
             return {k: "" for k in FIELDNAMES}
-        row = process_segment(args, video_path, str(self.qualified_dir))
-        self._append_csv(self.all_csv, row)
-        if not row.get("video_filter_reject_reason"):
-            self._append_csv(self.qual_csv, row)
-        self.processed.add(video_path)
-        return row
+
+        local_video = None
+        try:
+            # ── OBS: 下载到本地 ──
+            if self.obs_io.enabled:
+                local_video = self.obs_io.download(video_path)
+            else:
+                local_video = video_path
+
+            row = process_segment(args, local_video, str(self.qualified_dir))
+
+            # ── OBS: 上传合格视频，CSV 写 obs_key 而非本地路径 ──
+            if self.obs_io.enabled and not row.get("video_filter_reject_reason"):
+                local_result = row.get("video_path", "")
+                if local_result and Path(local_result).is_file():
+                    obs_key = self.obs_io.make_obs_key(
+                        "qualified_videos", Path(local_result).name
+                    )
+                    self.obs_io.upload(local_result, obs_key)
+                    row["video_path"] = obs_key
+                    # 删除本地输出
+                    self.obs_io.cleanup(local_result)
+
+            self._append_csv(self.all_csv, row)
+            if not row.get("video_filter_reject_reason"):
+                self._append_csv(self.qual_csv, row)
+            self.processed.add(video_path)
+            return row
+        finally:
+            # ── OBS: 清理下载的临时文件 ──
+            if self.obs_io.enabled and local_video and local_video != video_path:
+                self.obs_io.cleanup(local_video)
 
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser(description="视频质量过滤 + FPS/音频采样率标准化转码")
-parser.add_argument("--input_csv", default="/mnt/workspace/lihaoran/data_process/test/result/0616/data_5000_last/input_videos_deduped.csv")
-parser.add_argument("--output_dir", default="/mnt/workspace/lihaoran/data_process/test/result/0617/video_filter/data_5000_all/")
+parser.add_argument("--input_csv", default="/mnt/workspace/lihaoran/data_process/test_data/no_pepole/no_pepole.csv")
+parser.add_argument("--output_dir", default="/mnt/workspace/lihaoran/data_process/test/result/0618/video_filter/no_pepole/")
 parser.add_argument("--video_path_column", default="video_path")
 parser.add_argument("--min_resolution", default="1080p")
 parser.add_argument("--min_duration", type=int, default=121)
@@ -359,6 +388,9 @@ parser.add_argument("--max_duration", type=int, default=0)
 parser.add_argument("--target_fps", type=int, default=25)
 parser.add_argument("--target_audio_sr", type=int, default=48000)
 parser.add_argument("--copy_mode", choices=["symlink", "copy", "none"], default="symlink")
+
+# OBS
+add_obs_args(parser)
 
 # Ray
 parser.add_argument("--ray", action="store_true", help="启用 Ray 分布式模式")

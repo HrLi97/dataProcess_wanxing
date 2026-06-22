@@ -23,7 +23,8 @@ _FILTER_ROOT = str(Path(__file__).resolve().parents[1])
 if _FILTER_ROOT not in sys.path:
     sys.path.insert(0, _FILTER_ROOT)
 
-from filter.filter_utils import unique_output_name, safe_name 
+from filter.filter_utils import unique_output_name, safe_name
+from filter.obs_helper import add_obs_args, ObsIO
 
 # ── 将 OmniShotCut 项目根目录加入 sys.path ──
 OMNISHOTCUT_ROOT = os.path.abspath(
@@ -312,7 +313,9 @@ class Worker:
                     sv = r.get("video_path", "")
                     if sv:
                         self.processed.add(sv)
-        logger.info(f"Worker initialized: OmniShotCut model loaded. 已处理 {len(self.processed)} 条。")
+        # OBS
+        self.obs_io = ObsIO(args)
+        logger.info(f"Worker initialized: OmniShotCut model loaded. OBS={self.obs_io.enabled}. 已处理 {len(self.processed)} 条。")
 
     def _append_csv(self, filepath, row):
         with open(filepath, "a", newline="", encoding="utf-8") as f:
@@ -330,13 +333,44 @@ class Worker:
             return row
         if vid_path in self.processed:
             return {k: "" for k in CUTSHOT_FIELDS}
-        rows = process_single_video(vid_path, self.model, self.model_args, args, item)
-        for row in rows:
-            self._append_csv(self.all_csv, row)
-            if not row.get("cutshot_reject_reason"):
-                self._append_csv(self.qual_csv, row)
-        self.processed.add(vid_path)
-        return rows[0] if rows else {k: "" for k in CUTSHOT_FIELDS}
+
+        local_video = None
+        try:
+            # ── OBS: 下载源视频 ──
+            if self.obs_io.enabled:
+                local_video = self.obs_io.download(vid_path)
+            else:
+                local_video = vid_path
+
+            rows = process_single_video(local_video, self.model, self.model_args, args, item)
+
+            # ── OBS: 上传切割出的合格 segment，CSV 写 obs_key ──
+            if self.obs_io.enabled:
+                for row in rows:
+                    local_seg = row.get("video_path", "")
+                    if local_seg and os.path.isfile(local_seg) and not row.get("cutshot_reject_reason"):
+                        obs_key = self.obs_io.make_obs_key(
+                            "segments", os.path.basename(local_seg)
+                        )
+                        self.obs_io.upload(local_seg, obs_key)
+                        row["video_path"] = obs_key
+                        self.obs_io.cleanup(local_seg)
+
+            for row in rows:
+                self._append_csv(self.all_csv, row)
+                if not row.get("cutshot_reject_reason"):
+                    self._append_csv(self.qual_csv, row)
+            self.processed.add(vid_path)
+            return rows[0] if rows else {k: "" for k in CUTSHOT_FIELDS}
+        finally:
+            # ── OBS: 清理下载的源视频 + 本地 segment 目录 ──
+            if self.obs_io.enabled and local_video and local_video != vid_path:
+                self.obs_io.cleanup(local_video)
+                # 清理本地 segments 目录（已上传）
+                seg_dir = os.path.join(args.output_dir, "segments")
+                if os.path.isdir(seg_dir):
+                    import shutil
+                    shutil.rmtree(seg_dir, ignore_errors=True)
 
 
 # transition_type 取值:
@@ -348,12 +382,15 @@ class Worker:
 #   "Transition_Source" = 转场源镜头尾部 (rejected)
 #   "Padding"           = 无效 padding (rejected)
 parser = argparse.ArgumentParser(description="OmniShotCut 场景切分 (Ray / Local)")
-parser.add_argument("--input_csv", type=str, default="/mnt/workspace/lihaoran/data_process/test/result/0617/video_filter/data_5000_all/video_filter_qualified.csv", help="输入 CSV")
-parser.add_argument("--output_dir", type=str, default="/mnt/workspace/lihaoran/data_process/test/result/0617/filter_shotcut/data_5000_all/", help="输出根目录")
+parser.add_argument("--input_csv", type=str, default="/mnt/workspace/lihaoran/data_process/test/result/0618/video_filter/no_pepole/video_filter_qualified.csv", help="输入 CSV")
+parser.add_argument("--output_dir", type=str, default="/mnt/workspace/lihaoran/data_process/test/result/0618/filter_shotcut/no_pepole/", help="输出根目录")
 parser.add_argument("--video_path_column", type=str, default="video_path", help="输入 CSV 中视频路径列名")
 parser.add_argument("--checkpoint_path", type=str, default=os.path.join(OMNISHOTCUT_ROOT, "checkpoints", "OmniShotCut_ckpt.pth"))
 parser.add_argument("--mode", type=str, default="clean_shot", choices=["default", "clean_shot"], help="clean_shot 只保留 general 硬切镜头")
 parser.add_argument("--num_context_frames", type=int, default=5, help="上下文帧数")
+
+# OBS
+add_obs_args(parser)
 
 # Ray
 parser.add_argument("--ray", action="store_true", help="启用 Ray 分布式模式")
