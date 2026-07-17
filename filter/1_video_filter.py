@@ -16,6 +16,7 @@ import argparse
 import csv
 import fcntl
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -31,9 +32,9 @@ from filter.obs_helper import add_obs_args, ObsIO
 # ─── ffprobe ─────────────────────────────────────────────────────────────────
 
 def get_media_info(video_path):
-    """使用 ffprobe 获取媒体信息(JSON 格式)"""
+    """使用 ffprobe 获取媒体信息(JSON 格式)。返回 (info, error_reason)。"""
     cmd = [
-        "ffprobe", "-v", "quiet",
+        "ffprobe", "-v", "error",
         "-print_format", "json",
         "-show_format", "-show_streams",
         str(video_path),
@@ -41,16 +42,29 @@ def get_media_info(video_path):
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if result.returncode != 0:
-            return None
-        return json.loads(result.stdout)
-    except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError):
-        return None
+            err = (result.stderr or "").strip().replace("\n", " | ")
+            return None, f"ffprobe_rc={result.returncode} stderr={err[:300]}"
+
+        stdout = (result.stdout or "").strip()
+        if not stdout:
+            return None, "ffprobe_empty_stdout"
+
+        try:
+            return json.loads(stdout), ""
+        except json.JSONDecodeError as e:
+            return None, f"ffprobe_json_decode_error={e} stdout_head={stdout[:200]}"
+    except subprocess.TimeoutExpired:
+        return None, "ffprobe_timeout_30s"
+    except FileNotFoundError:
+        return None, "ffprobe_not_found"
+    except Exception as e:
+        return None, f"ffprobe_exception={type(e).__name__}:{e}"
 
 
 def parse_media_info(info):
-    """从 ffprobe JSON 中同时解析视频 + 音频参数"""
+    """从 ffprobe JSON 中同时解析视频 + 音频参数。返回 (parsed, error_reason)。"""
     if not info:
-        return None
+        return None, "empty_ffprobe_info"
 
     result = {}
 
@@ -61,7 +75,7 @@ def parse_media_info(info):
             video_stream = s
             break
     if not video_stream:
-        return None
+        return None, "no_video_stream"
 
     result["width"] = video_stream.get("width", 0)
     result["height"] = video_stream.get("height", 0)
@@ -97,15 +111,20 @@ def parse_media_info(info):
 
     # ── 音频流 ──
     result["audio_sample_rate"] = 0
+    result["audio_bitrate"] = 0
     for s in info.get("streams", []):
         if s.get("codec_type") == "audio":
             try:
                 result["audio_sample_rate"] = int(s.get("sample_rate", 0))
             except (TypeError, ValueError):
                 pass
+            try:
+                result["audio_bitrate"] = int(s.get("bit_rate", 0) or 0)
+            except (TypeError, ValueError):
+                pass
             break
 
-    return result
+    return result, ""
 
 
 # ─── 分辨率预设(总像素阈值) ────────────────────────────────────────────────
@@ -174,12 +193,37 @@ def transcode_video(input_path, output_path,
         return False
 
 
+def get_audio_max_volume_db(media_path, timeout_sec=60):
+    """返回 (max_volume_db, err_reason)。"""
+    cmd = [
+        "ffmpeg", "-hide_banner", "-i", str(media_path),
+        "-af", "volumedetect", "-f", "null", "-",
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+    except subprocess.TimeoutExpired:
+        return None, "audio_probe_timeout"
+    except FileNotFoundError:
+        return None, "ffmpeg_not_found"
+    except Exception as e:
+        return None, f"audio_probe_exception={type(e).__name__}:{e}"
+
+    output = (r.stdout or "") + "\n" + (r.stderr or "")
+    m = re.search(r"max_volume:\s*(-?\d+(?:\.\d+)?)\s*dB", output)
+    if not m:
+        return None, "audio_probe_parse_failed"
+    try:
+        return float(m.group(1)), ""
+    except Exception:
+        return None, "audio_probe_parse_failed"
+
+
 # ─── CSV 字段 ────────────────────────────────────────────────────────────────
 
 FIELDNAMES = [
-    "video_path",
+    "video_path", "_source_key",
     "video_filter_reject_reason",
-    "resolution", "source_fps", "source_audio_sample_rate", "source_bitrate",
+    "resolution", "source_fps", "source_audio_sample_rate", "source_audio_max_volume_db", "source_bitrate",
     "duration", "was_transcoded",
 ]
 
@@ -192,6 +236,7 @@ def process_segment(args, video_path, qualified_dir):
         "video_filter_reject_reason": "",
         "resolution": "",
         "source_fps": "", "source_audio_sample_rate": "",
+        "source_audio_max_volume_db": "",
         "source_bitrate": "", "duration": "",
         "was_transcoded": False,
     }
@@ -202,9 +247,18 @@ def process_segment(args, video_path, qualified_dir):
         return row
 
     # ── 解析媒体信息 ──
-    parsed = parse_media_info(get_media_info(video_path))
+    info, probe_err = get_media_info(video_path)
+    parsed, parse_err = parse_media_info(info)
     if not parsed:
         row["video_filter_reject_reason"] = "parse_failed"
+        try:
+            size_bytes = seg_path.stat().st_size
+        except Exception:
+            size_bytes = -1
+        print(
+            f"  [parse_failed] path={seg_path} size={size_bytes} "
+            f"probe_err={probe_err or '-'} parse_err={parse_err or '-'}"
+        )
         return row
 
     row.update({
@@ -227,9 +281,18 @@ def process_segment(args, video_path, qualified_dir):
     if min_pixels > 0 and total_px < min_pixels:
         reasons.append(f"low_resolution_{parsed['width']}x{parsed['height']}")
 
-    # 无音频直接丢弃
+    # 无音频是否过滤由开关控制（默认不过滤）
     if parsed["audio_sample_rate"] == 0:
-        reasons.append("no_audio")
+        if args.filter_no_audio:
+            reasons.append("no_audio")
+    elif args.enable_audio_max_volume_filter:
+        audio_max_db, audio_probe_err = get_audio_max_volume_db(seg_path)
+        if audio_max_db is None:
+            reasons.append(audio_probe_err or "audio_probe_failed")
+        else:
+            row["source_audio_max_volume_db"] = round(audio_max_db, 2)
+            if audio_max_db < args.min_audio_max_volume_db:
+                reasons.append(f"audio_too_quiet_maxdb_{audio_max_db:.2f}")
 
     # 时长(帧)
     total_frames = parsed["total_frames"]
@@ -323,9 +386,9 @@ class Worker:
         if self.all_csv.exists():
             with open(self.all_csv, encoding="utf-8") as f:
                 for r in csv.DictReader(f):
-                    vp = r.get("video_path", "")
-                    if vp:
-                        self.processed.add(vp)
+                    sk = r.get("_source_key") or r.get("video_path", "")
+                    if sk:
+                        self.processed.add(sk)
         # OBS
         self.obs_io = ObsIO(args)
         print(f"Worker initialized. OBS={self.obs_io.enabled}. 已处理 {len(self.processed)} 条。")
@@ -349,6 +412,13 @@ class Worker:
             # ── OBS: 下载到本地 ──
             if self.obs_io.enabled:
                 local_video = self.obs_io.download(video_path)
+                if local_video is None:
+                    row = {k: "" for k in FIELDNAMES}
+                    row["video_filter_reject_reason"] = "obs_download_failed"
+                    row["_source_key"] = video_path
+                    self._append_csv(self.all_csv, row)
+                    self.processed.add(video_path)
+                    return row
             else:
                 local_video = video_path
 
@@ -366,6 +436,7 @@ class Worker:
                     # 删除本地输出
                     self.obs_io.cleanup(local_result)
 
+            row["_source_key"] = video_path
             self._append_csv(self.all_csv, row)
             if not row.get("video_filter_reject_reason"):
                 self._append_csv(self.qual_csv, row)
@@ -379,14 +450,20 @@ class Worker:
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser(description="视频质量过滤 + FPS/音频采样率标准化转码")
-parser.add_argument("--input_csv", default="/mnt/workspace/lihaoran/data_process/test_data/no_pepole/no_pepole.csv")
-parser.add_argument("--output_dir", default="/mnt/workspace/lihaoran/data_process/test/result/0618/video_filter/no_pepole/")
+parser.add_argument("--input_csv", default="/home/ma-user/work/lihaoran/all_data/testcsv/0622/OpenS2V-5M.csv")
+parser.add_argument("--output_dir", default="/home/ma-user/work/lihaoran/data_process/test/result/0624/video_filter/")
 parser.add_argument("--video_path_column", default="video_path")
 parser.add_argument("--min_resolution", default="1080p")
 parser.add_argument("--min_duration", type=int, default=121)
 parser.add_argument("--max_duration", type=int, default=0)
 parser.add_argument("--target_fps", type=int, default=25)
 parser.add_argument("--target_audio_sr", type=int, default=48000)
+parser.add_argument("--filter_no_audio", action="store_true",
+                    help="开启后过滤无音频视频(默认关闭)")
+parser.add_argument("--enable_audio_max_volume_filter", action="store_true",
+                    help="开启后才按 --min_audio_max_volume_db 过滤，默认关闭")
+parser.add_argument("--min_audio_max_volume_db", type=float, default=-50.0,
+                    help="最小可听峰值音量(dB)。低于阈值判为近静音")
 parser.add_argument("--copy_mode", choices=["symlink", "copy", "none"], default="symlink")
 
 # OBS
@@ -394,30 +471,22 @@ add_obs_args(parser)
 
 # Ray
 parser.add_argument("--ray", action="store_true", help="启用 Ray 分布式模式")
-parser.add_argument("--ray_num_gpus", type=float, default=0.0)
+parser.add_argument("--ray_num_gpus", type=float, default=0, help="GPU 资源 (无 GPU 时设 0)")
+parser.add_argument("--ray_num_npus", type=float, default=0, help="NPU 自定义资源 (video_filter 不需要 NPU)")
 parser.add_argument("--ray_num_cpus", type=float, default=1)
-parser.add_argument("--concurrency", type=int, default=24)
+parser.add_argument("--concurrency", type=int, default=48)
 args = parser.parse_args()
 
 
 if __name__ == "__main__":
-
-    # ── 去重：按 video_path_column 去重，避免重复处理 ──
     import pandas as pd
-    df = pd.read_csv(args.input_csv, encoding="utf-8")
-    before_cnt = len(df)
-    df = df.drop_duplicates(subset=[args.video_path_column], keep="first")
-    after_cnt = len(df)
-    if before_cnt != after_cnt:
-        print(f"去重: {before_cnt} → {after_cnt} (去除 {before_cnt - after_cnt} 条重复)")
-    deduped_csv = args.input_csv.replace(".csv", "_deduped.csv")
-    df.to_csv(deduped_csv, index=False)
+    df = pd.read_csv(args.input_csv, encoding="utf-8", encoding_errors="replace")
 
     if not args.ray:
         # ── 本地模式 ──
-        samples = list(csv.DictReader(open(deduped_csv, encoding="utf-8")))
+        samples = list(csv.DictReader(open(args.input_csv, encoding="utf-8")))
         total = len(samples)
-        print(f"读取 {total} 条记录 from {deduped_csv}")
+        print(f"读取 {total} 条记录 from {args.input_csv}")
         worker = Worker()
         for i, item in enumerate(samples, 1):
             print(f"[{i}/{total}] {item.get(args.video_path_column, '')}")
@@ -428,16 +497,23 @@ if __name__ == "__main__":
         # ── Ray 分布式模式 ──
         import ray
         ray.init(address="auto")
+        try:
+            import ray.autoscaler._private.util  # noqa: F401
+        except Exception:
+            pass
         from ray.data import ActorPoolStrategy
-        samples = ray.data.read_csv(deduped_csv).materialize()
+        samples = ray.data.from_pandas(df).materialize()
         target_parallelism = min(args.concurrency, samples.count())
         if samples.num_blocks() < target_parallelism:
             samples = samples.repartition(target_parallelism)
-        predictions = samples.map(
-            Worker,
-            num_gpus=args.ray_num_gpus,
+        map_kwargs = dict(
             num_cpus=max(args.ray_num_cpus, 1),
             compute=ActorPoolStrategy(size=target_parallelism),
         )
+        if args.ray_num_gpus > 0:
+            map_kwargs["num_gpus"] = args.ray_num_gpus
+        if args.ray_num_npus > 0:
+            map_kwargs["resources"] = {"NPU": args.ray_num_npus}
+        predictions = samples.map(Worker, **map_kwargs)
         predictions.take_all()
         print("Ray 完成")
