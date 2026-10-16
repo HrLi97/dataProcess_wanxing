@@ -8,14 +8,14 @@
 #
 set -euo pipefail
 
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # 脚本在 script/ 下，项目根是上一级
 
 INPUT_DIR="$PROJECT_ROOT/test_data/0615_movie_1"
 OUTPUT_ROOT="$PROJECT_ROOT/test/result/0615/pipeline_movie_1"
 
 # 默认参数
 USE_RAY=""
-STEPS="1,2,3,4,5"
+STEPS="1,2,3,4"   # 通用镜头（H3）默认不跑 Step 5 唇形同步
 SKIP_TO=0
 
 # 解析参数

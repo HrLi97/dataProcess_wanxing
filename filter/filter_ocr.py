@@ -60,17 +60,20 @@ PADDLEOCR_ROOT = os.environ.get(
     str(Path(__file__).resolve().parents[1] / "third_part" / "PaddleOCR"),
 )
 
-# PaddleOCR 模型缓存目录 (paddlex 自动下载到此处)
+# PaddleOCR 模型目录（env_ckps.sh 里 PADDLEOCR_MODEL_DIR=$CKPS_ROOT/paddlex/official_models），
+# 布局 <MODEL_CACHE_DIR>/<模型名>/inference.yml，create_ocr_engine 会把 det/rec 模型目录显式传给 PaddleOCR
 MODEL_CACHE_DIR = os.environ.get(
     "PADDLEOCR_MODEL_DIR",
     str(Path("/mnt/workspace/lihaoran/ckps/paddleocr")),
 )
 
-# 检测模型目录 (首次运行自动下载)
-DET_MODEL_DIR = os.path.join(MODEL_CACHE_DIR, "PP-OCRv4_mobile_det")
-
-# 识别模型目录 (首次运行自动下载)
-REC_MODEL_DIR = os.path.join(MODEL_CACHE_DIR, "PP-OCRv4_mobile_rec")
+# (ocr_version, lang) → (检测模型名, 识别模型名)，与 PaddleOCR 3.x PaddleOCR._get_ocr_model_names 一致
+OCR_MODEL_NAMES = {
+    ("PP-OCRv4", "ch"): ("PP-OCRv4_mobile_det", "PP-OCRv4_mobile_rec"),
+    ("PP-OCRv4", "en"): ("PP-OCRv4_mobile_det", "en_PP-OCRv4_mobile_rec"),
+    ("PP-OCRv5", "ch"): ("PP-OCRv5_server_det", "PP-OCRv5_server_rec"),
+    ("PP-OCRv5", "en"): ("PP-OCRv5_server_det", "en_PP-OCRv5_mobile_rec"),
+}
 
 # ============================================================
 # 推理参数配置
@@ -82,7 +85,7 @@ CFG_DET_BOX_THRESH = 0.5              # 文字检测框置信度阈值
 CFG_REC_SCORE_THRESH = 0.5            # 文字识别置信度阈值
 CFG_DET_LIMIT_SIDE_LEN = 960          # 检测时图像最长边限制
 CFG_ENABLE_MKLDNN = False             # CPU推理时是否启用MKL-DNN(3.3.1有bug，建议False)
-CFG_DEVICE = "cuda"                    # 推理设备: cpu / gpu:0
+CFG_DEVICE = "cuda"                    # 推理设备: cpu / cuda[:N] / gpu[:N]（cuda 会转成 Paddle 的 gpu）
 
 # 视频文件后缀
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".flv", ".webm", ".MP4", ".MOV"}
@@ -128,13 +131,21 @@ def setup_paddle_env():
     paddle.set_flags({"FLAGS_use_mkldnn": False})
 
 
+def to_paddle_device(device):
+    """torch 风格设备名转 Paddle 风格：cuda / cuda:N → gpu / gpu:N；cpu、gpu:N 等原样返回。"""
+    device = (device or "").strip()
+    if device.startswith("cuda"):
+        return "gpu" + device[len("cuda"):]
+    return device
+
+
 def create_ocr_engine(lang=CFG_LANG, ocr_version=CFG_OCR_VERSION, device=CFG_DEVICE):
     """创建PaddleOCR推理引擎
 
     Args:
         lang: 语言
         ocr_version: OCR版本
-        device: 推理设备
+        device: 推理设备（cpu / cuda[:N] / gpu[:N]）
 
     Returns:
         PaddleOCR 实例
@@ -145,14 +156,27 @@ def create_ocr_engine(lang=CFG_LANG, ocr_version=CFG_OCR_VERSION, device=CFG_DEV
         use_doc_orientation_classify=False,
         use_doc_unwarping=False,
         use_textline_orientation=False,
-        lang=lang,
-        ocr_version=ocr_version,
         enable_mkldnn=CFG_ENABLE_MKLDNN,
         text_det_box_thresh=CFG_DET_BOX_THRESH,
         text_rec_score_thresh=CFG_REC_SCORE_THRESH,
         text_det_limit_side_len=CFG_DET_LIMIT_SIDE_LEN,
     )
-    if device.startswith("gpu"):
+    # 本地有对应模型时显式传 模型名+目录：PaddleX 要求模型名与目录内 inference.yml 的 model_name 一致，
+    # 且传了模型名/目录后 PaddleOCR 会忽略 lang/ocr_version；本地没有时沿用 lang/ocr_version，由 PaddleX 读缓存或下载
+    det_name, rec_name = OCR_MODEL_NAMES.get((ocr_version, lang), (None, None))
+    det_dir = os.path.join(MODEL_CACHE_DIR, det_name) if det_name else ""
+    rec_dir = os.path.join(MODEL_CACHE_DIR, rec_name) if rec_name else ""
+    if os.path.isdir(det_dir) and os.path.isdir(rec_dir):
+        kwargs.update(
+            text_detection_model_name=det_name, text_detection_model_dir=det_dir,
+            text_recognition_model_name=rec_name, text_recognition_model_dir=rec_dir,
+        )
+    else:
+        print(f"[OCR] {MODEL_CACHE_DIR} 下没有 {det_name}/{rec_name}，按 lang={lang} ocr_version={ocr_version} 由 PaddleX 解析模型")
+        kwargs.update(lang=lang, ocr_version=ocr_version)
+    # PaddleX 只认 cpu / gpu[:N] 等（cuda 会触发 assert），原来只透传 gpu*，cuda / cpu 都被丢掉、落到 PaddleOCR 默认设备
+    device = to_paddle_device(device)
+    if device:
         kwargs["device"] = device
 
     ocr = PaddleOCR(**kwargs)

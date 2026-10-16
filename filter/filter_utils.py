@@ -1,6 +1,8 @@
 """共享工具函数，所有 Runner 均可引用。"""
 import argparse
 import contextlib
+import csv
+import fcntl
 import hashlib
 import json
 import os
@@ -106,6 +108,54 @@ def link_or_copy(src, dst, mode):
     except OSError:
         shutil.copy2(src, dst)
     return str(dst)
+
+
+# ─── 输出 CSV / 断点续跑 ──────────────────────────────────────────────────────
+# all CSV 额外记录本步的输入路径，断点续跑按它判断"已处理"
+# （输出行的 video_path 是输出路径、拒绝行还为空，不能当 key）
+INPUT_PATH_FIELD = "input_video_path"
+
+
+def init_csv(path, fieldnames):
+    """初始化输出 CSV，返回文件实际表头（追加行时用它，保证与已有内容列对齐）。
+
+    - 不存在 / 为空：写入 fieldnames 表头；
+    - 已存在但缺少 fieldnames 中的列（旧版本产出）：原地在表头末尾补列，旧行补空。
+    持 flock（与各 step 的 _append_csv 同一把锁），Ray 多 actor 同时初始化也安全。
+    """
+    with open(path, "a+", newline="", encoding="utf-8") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            f.seek(0)
+            rows = list(csv.reader(f))
+            header = rows[0] if rows else []
+            missing = [c for c in dict.fromkeys(fieldnames) if c not in header]
+            if missing:
+                header = header + missing
+                f.seek(0)
+                f.truncate()
+                w = csv.writer(f)
+                w.writerow(header)
+                w.writerows((r + [""] * (len(header) - len(r))) if r else r for r in rows[1:])
+                f.flush()
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+    return header
+
+
+def load_processed_inputs(all_csv, legacy_field="video_path"):
+    """断点续跑：从 all CSV 读取已处理过的输入路径集合。
+
+    每行取 INPUT_PATH_FIELD；旧版 CSV 没有该列（或值为空）时回退到 legacy_field（即旧逻辑，保持兼容）。
+    """
+    processed = set()
+    if os.path.exists(all_csv):
+        with open(all_csv, encoding="utf-8-sig") as f:
+            for r in csv.DictReader(f):
+                key = r.get(INPUT_PATH_FIELD) or r.get(legacy_field) or ""
+                if key:
+                    processed.add(key)
+    return processed
 
 
 # ─── BBox 工具 ────────────────────────────────────────────────────────────────

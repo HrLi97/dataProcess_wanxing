@@ -19,6 +19,7 @@ import json
 import re
 import shutil
 import subprocess
+from collections import Counter
 from pathlib import Path
 import sys
 
@@ -26,7 +27,7 @@ _FILTER_ROOT = Path(__file__).resolve().parents[1]
 if str(_FILTER_ROOT) not in sys.path:
     sys.path.insert(0, str(_FILTER_ROOT))
 
-from filter.filter_utils import unique_output_name, worker_syspath_setup
+from filter.filter_utils import unique_output_name, worker_syspath_setup, init_csv
 from filter.obs_helper import add_obs_args, ObsIO
 
 # ─── ffprobe ─────────────────────────────────────────────────────────────────
@@ -80,6 +81,20 @@ def parse_media_info(info):
     result["width"] = video_stream.get("width", 0)
     result["height"] = video_stream.get("height", 0)
 
+    # 旋转角（手机竖拍常见）：ffmpeg 解码时会自动转正，cropdetect 给出的是转正后的坐标
+    result["rotation"] = 0
+    for sd in video_stream.get("side_data_list") or []:
+        if "rotation" in sd:
+            try:
+                result["rotation"] = int(float(sd["rotation"]))
+            except (TypeError, ValueError):
+                pass
+    if not result["rotation"]:
+        try:
+            result["rotation"] = int(float((video_stream.get("tags") or {}).get("rotate", 0)))
+        except (TypeError, ValueError):
+            pass
+
     # FPS(from r_frame_rate, e.g. "30000/1001")
     r_fr = video_stream.get("r_frame_rate", "0/1")
     try:
@@ -130,11 +145,22 @@ def parse_media_info(info):
 # ─── 分辨率预设(总像素阈值) ────────────────────────────────────────────────
 # 以更宽松的像素阈值替代传统分辨率标准，适应不同宽高比的视频
 RESOLUTION_PRESETS = {
+    "none": 0,
     "360p": 480 * 480,
     "480p": 600 * 600,
     "720p": 900 * 900,
     "1080p": 1376 * 1376,
 }
+
+
+def resolve_min_pixels(value) -> int:
+    """--min_resolution: 预设名（见 RESOLUTION_PRESETS）或纯数字像素数；未知值直接报错，不再静默关闭过滤。"""
+    text = str(value).strip().lower()
+    if text.isdigit():
+        return int(text)
+    if text not in RESOLUTION_PRESETS:
+        raise ValueError(f"未知的 --min_resolution {value!r}，可选 {sorted(RESOLUTION_PRESETS)} 或像素数")
+    return RESOLUTION_PRESETS[text]
 
 
 # ─── 验证 MP4 文件有效性 ──────────────────────────────────────────────────────
@@ -218,6 +244,87 @@ def get_audio_max_volume_db(media_path, timeout_sec=60):
         return None, "audio_probe_parse_failed"
 
 
+# ─── 黑边检测 ────────────────────────────────────────────────────────────────
+_CROPDETECT_RE = re.compile(r"\bt:\s*(-?[\d.]+).*?crop=(-?\d+):(-?\d+):(-?\d+):(-?\d+)")
+
+
+def _cropdetect_at(video_path, t_sec, timeout_sec=60):
+    """从 t_sec 起用 cropdetect 找内容框，返回 (最后评估帧的时间戳, (w, h, x, y))；失败返回 None。
+
+    先只解码关键帧（快，且几帧之间相隔较远、画面更多样）；t_sec 之后关键帧不够时（短视频、关键帧间隔长）
+    改为解码连续帧。cropdetect 默认跳过前 2 帧，reset=0 表示取评估过的各帧内容的并集。
+    """
+    for decode_opts, n_frames in ((["-skip_frame", "nokey"], 5), ([], 8)):
+        # -copyts：时间戳保持源视频的绝对时间（不从 seek 点归零），用于去重；-vsync 0：不为凑恒定帧率而复制帧
+        cmd = [
+            "ffmpeg", "-hide_banner", "-nostats", "-copyts",
+            *decode_opts, "-ss", f"{t_sec:.3f}", "-i", str(video_path),
+            "-map", "0:v:0", "-vf", "cropdetect=limit=24:round=2:reset=0",
+            "-vsync", "0", "-frames:v", str(n_frames), "-an", "-f", "null", "-",
+        ]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+        except Exception:
+            return None
+        found = _CROPDETECT_RE.findall(r.stderr or "")
+        if found:
+            t, *box = found[-1]
+            return round(float(t), 3), tuple(int(v) for v in box)
+    return None
+
+
+def _stable_bar(values):
+    """一条边的黑边宽度：在重复出现的值（按 4 像素分桶，至少 20% 的采样点）里取最大的。
+
+    字幕、台标压在黑边上只会让黑边变窄；暗场景会让黑边变宽，但每个场景暗得不一样，很少重复。
+    所以重复出现的最宽值就是真实黑边。没有重复值时取中位数。
+    """
+    need = max(2, -(-len(values) // 5))
+    bins = Counter(v // 4 for v in values)
+    stable = [b for b, c in bins.items() if c >= need]
+    if stable:
+        top_bin = max(stable)
+        return max(v for v in values if v // 4 == top_bin)
+    return sorted(values)[len(values) // 2]
+
+
+def detect_letterbox(video_path, duration_sec, frame_w, frame_h, samples=12, min_bar_ratio=0.01):
+    """估计整片的黑边，返回裁切框 (w, h, x, y)；没有明显黑边或检测失败时返回 None。
+
+    在 5%~95% 时长内均匀取 samples 个点，每个点得到上下左右四条黑边的宽度，每条边各自用 _stable_bar 汇总。
+    黑边里的字幕会随黑边一起裁掉。frame_w / frame_h 是转正后的显示尺寸。
+    不足 min_bar_ratio 的边（压缩噪声、一两个像素的脏边）不裁。
+    """
+    if samples <= 0 or duration_sec <= 0 or frame_w <= 0 or frame_h <= 0:
+        return None
+    bars = {}  # 最后评估帧的时间戳 -> (左, 上, 右, 下)；短视频里相邻采样点可能落在同一组关键帧上，按时间戳去重
+    for i in range(samples):
+        t = duration_sec * (0.05 + 0.9 * i / max(samples - 1, 1))
+        res = _cropdetect_at(video_path, t)
+        if not res:
+            continue
+        frame_t, (w, h, x, y) = res
+        # 全黑帧（片头片尾、淡入淡出）会给出负数或很小的框，丢掉
+        if x < 0 or y < 0 or w < frame_w * 0.3 or h < frame_h * 0.3:
+            continue
+        bars[frame_t] = (x, y, max(frame_w - x - w, 0), max(frame_h - y - h, 0))
+    if len(bars) < 3:
+        return None
+
+    left, top, right, bottom = (_stable_bar([b[k] for b in bars.values()]) for k in range(4))
+    min_x, min_y = frame_w * min_bar_ratio, frame_h * min_bar_ratio
+    left, right = [v if v >= min_x else 0 for v in (left, right)]
+    top, bottom = [v if v >= min_y else 0 for v in (top, bottom)]
+    if not (left or right or top or bottom):
+        return None
+    w = frame_w - left - right
+    h = frame_h - top - bottom
+    w, h = w - w % 2, h - h % 2  # yuv420p 要求偶数宽高
+    if w < frame_w * 0.3 or h < frame_h * 0.3:
+        return None
+    return w, h, left, top
+
+
 # ─── CSV 字段 ────────────────────────────────────────────────────────────────
 
 FIELDNAMES = [
@@ -225,6 +332,7 @@ FIELDNAMES = [
     "video_filter_reject_reason",
     "resolution", "source_fps", "source_audio_sample_rate", "source_audio_max_volume_db", "source_bitrate",
     "duration", "was_transcoded",
+    "crop",  # 黑边裁切框 w:h:x:y（Step 2 切片时裁），空 = 不裁
 ]
 
 
@@ -239,6 +347,7 @@ def process_segment(args, video_path, qualified_dir):
         "source_audio_max_volume_db": "",
         "source_bitrate": "", "duration": "",
         "was_transcoded": False,
+        "crop": "",
     }
 
     seg_path = Path(video_path)
@@ -272,14 +381,14 @@ def process_segment(args, video_path, qualified_dir):
     # ── 质量检查 ──
     reasons = []
 
-    # 分辨率
-    if isinstance(args.min_resolution, str):
-        min_pixels = RESOLUTION_PRESETS.get(args.min_resolution, 0)
-    else:
-        min_pixels = int(args.min_resolution)
+    # 分辨率：总像素（--min_resolution）和短边（--min_short_side）两道门槛，任一不满足即拒。
+    # 短边门槛不会误杀 1920x800 这类宽银幕（总像素门槛 1080p=1376² 会）。
+    min_pixels = resolve_min_pixels(args.min_resolution)
     total_px = parsed["width"] * parsed["height"]
     if min_pixels > 0 and total_px < min_pixels:
         reasons.append(f"low_resolution_{parsed['width']}x{parsed['height']}")
+    elif args.min_short_side > 0 and min(parsed["width"], parsed["height"]) < args.min_short_side:
+        reasons.append(f"low_short_side_{parsed['width']}x{parsed['height']}")
 
     # 无音频是否过滤由开关控制（默认不过滤）
     if parsed["audio_sample_rate"] == 0:
@@ -301,6 +410,19 @@ def process_segment(args, video_path, qualified_dir):
     if args.max_duration > 0 and total_frames > args.max_duration:
         reasons.append(f"too_long_{total_frames}frames")
 
+    # 黑边：只对通过上面检查的片子检测（每片几秒）；去掉黑边后的内容再按短边门槛判一次
+    if not reasons and args.letterbox_samples > 0:
+        disp_w, disp_h = parsed["width"], parsed["height"]
+        if abs(parsed.get("rotation", 0)) % 180 == 90:
+            disp_w, disp_h = disp_h, disp_w
+        crop = detect_letterbox(video_path, parsed["duration"], disp_w, disp_h,
+                                samples=args.letterbox_samples)
+        if crop:
+            cw, ch, cx, cy = crop
+            row["crop"] = f"{cw}:{ch}:{cx}:{cy}"
+            if args.min_short_side > 0 and min(cw, ch) < args.min_short_side:
+                reasons.append(f"low_content_short_side_{cw}x{ch}")
+
     if reasons:
         row["video_filter_reject_reason"] = ",".join(reasons)
         print(f"  不通过: {seg_path.name} | {', '.join(reasons)}")
@@ -308,7 +430,10 @@ def process_segment(args, video_path, qualified_dir):
 
     # ── 转码检查 ──
     need_fps = abs(parsed["fps"] - args.target_fps) > 0.5
-    need_audio = parsed["audio_sample_rate"] != args.target_audio_sr
+    # target_audio_sr <= 0：保留源采样率（不为改音频重写整部片，统一到训练采样率放在切片时做）；
+    # 无音轨（采样率 0）不触发转码
+    need_audio = (args.target_audio_sr > 0 and parsed["audio_sample_rate"] > 0
+                  and parsed["audio_sample_rate"] != args.target_audio_sr)
 
     if need_fps or need_audio:
         out_name = unique_output_name(video_path, suffix=".mp4")
@@ -364,7 +489,7 @@ def process_segment(args, video_path, qualified_dir):
 
     print(f"  通过: {seg_path.name} | {parsed['width']}x{parsed['height']}, "
           f"fps={parsed['fps']}, sr={parsed['audio_sample_rate']}, "
-          f"tc={row['was_transcoded']}")
+          f"tc={row['was_transcoded']}" + (f", crop={row['crop']}" if row["crop"] else ""))
     return row
 
 
@@ -377,10 +502,8 @@ class Worker:
         self.qualified_dir.mkdir(parents=True, exist_ok=True)
         self.all_csv = self.output_dir / "video_filter_all.csv"
         self.qual_csv = self.output_dir / "video_filter_qualified.csv"
-        for p in (self.all_csv, self.qual_csv):
-            if not p.exists():
-                with open(p, "w", newline="", encoding="utf-8") as f:
-                    csv.DictWriter(f, fieldnames=FIELDNAMES).writeheader()
+        # 以文件实际表头追加（旧 CSV 缺 crop 等新列时原地补列）
+        self.csv_fields = {p: init_csv(p, FIELDNAMES) for p in (self.all_csv, self.qual_csv)}
         # 断点续跑：加载已处理的 video_path
         self.processed = set()
         if self.all_csv.exists():
@@ -396,7 +519,7 @@ class Worker:
     def _append_csv(self, filepath, row):
         with open(filepath, "a", newline="", encoding="utf-8") as f:
             fcntl.flock(f, fcntl.LOCK_EX)
-            csv.DictWriter(f, fieldnames=FIELDNAMES, extrasaction="ignore").writerow(row)
+            csv.DictWriter(f, fieldnames=self.csv_fields[filepath], extrasaction="ignore").writerow(row)
             f.flush()
             fcntl.flock(f, fcntl.LOCK_UN)
 
@@ -453,11 +576,17 @@ parser = argparse.ArgumentParser(description="视频质量过滤 + FPS/音频采
 parser.add_argument("--input_csv", default="/home/ma-user/work/lihaoran/all_data/testcsv/0622/OpenS2V-5M.csv")
 parser.add_argument("--output_dir", default="/home/ma-user/work/lihaoran/data_process/test/result/0624/video_filter/")
 parser.add_argument("--video_path_column", default="video_path")
-parser.add_argument("--min_resolution", default="1080p")
-parser.add_argument("--min_duration", type=int, default=121)
+# 默认值按 MiniMax-H3 训练数据：24 fps、768p、片段 124 帧（17n+5）、音频 32 kHz 立体声（切片时统一）
+parser.add_argument("--min_resolution", default="none",
+                    help="总像素门槛：none/360p/480p/720p/1080p 或像素数")
+parser.add_argument("--min_short_side", type=int, default=768,
+                    help="短边门槛（像素），0 关闭；H3 训练分辨率为 768p")
+parser.add_argument("--min_duration", type=int, default=124, help="最短帧数（源帧率下）")
 parser.add_argument("--max_duration", type=int, default=0)
-parser.add_argument("--target_fps", type=int, default=25)
-parser.add_argument("--target_audio_sr", type=int, default=48000)
+parser.add_argument("--target_fps", type=int, default=24,
+                    help="目标帧率（偏差 >0.5 才转码）；H3 为 24")
+parser.add_argument("--target_audio_sr", type=int, default=0,
+                    help="目标音频采样率，0=保留源采样率（默认；切片时再统一到 32 kHz）")
 parser.add_argument("--filter_no_audio", action="store_true",
                     help="开启后过滤无音频视频(默认关闭)")
 parser.add_argument("--enable_audio_max_volume_filter", action="store_true",
@@ -465,6 +594,8 @@ parser.add_argument("--enable_audio_max_volume_filter", action="store_true",
 parser.add_argument("--min_audio_max_volume_db", type=float, default=-50.0,
                     help="最小可听峰值音量(dB)。低于阈值判为近静音")
 parser.add_argument("--copy_mode", choices=["symlink", "copy", "none"], default="symlink")
+parser.add_argument("--letterbox_samples", type=int, default=12,
+                    help="黑边检测的采样点数，0=不检测；检测到的裁切框写入 crop 列，Step 2 切片时裁掉")
 
 # OBS
 add_obs_args(parser)
@@ -476,6 +607,7 @@ parser.add_argument("--ray_num_npus", type=float, default=0, help="NPU 自定义
 parser.add_argument("--ray_num_cpus", type=float, default=1)
 parser.add_argument("--concurrency", type=int, default=48)
 args = parser.parse_args()
+resolve_min_pixels(args.min_resolution)  # 非法值在启动时报错，而不是在每个 worker 里
 
 
 if __name__ == "__main__":

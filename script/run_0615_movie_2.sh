@@ -17,7 +17,7 @@ OUTPUT_ROOT="$PROJECT_ROOT/test/result/0615/pipeline_movie_3"
 
 # ─── 基础参数 ─────────────────────────────────────────────────────────────────
 USE_RAY=""
-STEPS="1,2,3,4,5"
+STEPS="1,2,3,4"                        # 通用镜头（H3）默认不跑 Step 5 唇形同步
 SKIP_TO=0
 
 export NUM_GPUS=16
@@ -29,32 +29,37 @@ export RAY_CONCURRENCY_STEP5=$((1 * NUM_GPUS))
 
 
 # ─── Step 1: 视频质量过滤 + 转码 ─────────────────────────────────────────────
-export S1_MIN_RESOLUTION="1080p"       # 最低分辨率: 360p / 480p / 720p / 1080p 或像素数
-export S1_MIN_DURATION=121             # 最短帧数 (25fps 下 81帧 ≈ 3.2秒)
+export S1_MIN_RESOLUTION="none"        # 总像素门槛: none / 360p / 480p / 720p / 1080p 或像素数
+export S1_MIN_SHORT_SIDE=768           # 短边门槛（H3 768p），不误杀宽银幕
+export S1_MIN_DURATION=124             # 最短帧数（至少能切出一个 124 帧片段）
 export S1_MAX_DURATION=0               # 最长帧数 (0=不限)
-export S1_TARGET_FPS=25                # 目标帧率
-export S1_TARGET_AUDIO_SR=48000        # 目标音频采样率
+export S1_TARGET_FPS=24                # 目标帧率（H3 为 24 fps）
+export S1_TARGET_AUDIO_SR=0            # 0=保留源采样率，Step 2 切片时统一到 32 kHz
 export S1_COPY_MODE="symlink"          # 无需转码时: symlink / copy / none
 export S1_RAY_NUM_CPUS=2               # 每个 worker 占用 CPU 数 (转码吃 CPU)
 
 # ─── Step 2: 场景切分 (OmniShotCut) ──────────────────────────────────────────
-export S2_MODE="clean_shot"            # 切分模式: default(所有转场) / clean_shot(仅硬切)
+export S2_MODE="multi_shot"            # 切分模式: multi_shot(默认，可跨硬切) / clean_shot(单镜头) / default
 export S2_NUM_CONTEXT_FRAMES=10         # 转场检测上下文帧数
+export S2_CLIP_FRAMES=124              # 片段帧数（H3 要求 17n+5）
+export S2_TRIM_FRAMES=3                # 每个镜头两端各裁掉的帧数
+export S2_AUDIO_SR=32000               # 片段音频采样率（H3）
+export S2_AUDIO_CHANNELS=2             # 片段音频声道（H3 立体声）
 export S2_RAY_NUM_GPUS=0.5             # 每个 worker GPU 份额
 
 # ─── Step 3: RAFT 运动过滤 ───────────────────────────────────────────────────
 # min_motion 参考: <0.5 静止, 0.5~2 talking head, 2~6 正常, 6~15 运动, >15 剧烈
-export S3_MIN_MOTION=10                # 运动分下限 (低于此视为静止丢弃)
-export S3_MAX_MOTION=200               # 运动分上限 (高于此视为抖动丢弃)
+export S3_MIN_MOTION=0.02              # 运动分下限：只去掉完全不动的画面
+export S3_MAX_MOTION=100               # 运动分上限：只去掉极端乱晃、闪烁
 export S3_SAMPLING_FPS=2               # 光流采样帧率
 export S3_MAX_SIZE=512                 # 输入帧缩放最大尺寸
 export S3_COPY_MODE="symlink"          # 通过时: symlink / copy / none
 export S3_RAY_NUM_GPUS=0.5
 
 # ─── Step 4: 质量评估过滤 (DOVER + AesV2.5 + KVQ) ───────────────────────────
-export S4_MIN_DOVER=0.4                # DOVER 总分阈值 (0~1, 越高越严)
-export S4_MIN_AES=4.2                  # Aesthetic V2.5 均分阈值 (1~10)
-export S4_MIN_KVQ=0.01                 # KVQ 分数阈值
+export S4_MIN_DOVER=0.23               # DOVER 总分阈值 (0~1, 越高越严)
+export S4_MIN_AES=3.5                  # Aesthetic V2.5 均分阈值 (1~10)
+export S4_MIN_KVQ=-0.004                # KVQ 分数阈值
 export S4_AES_FRAMES=16                # 美学评估采样帧数
 export S4_RAY_NUM_GPUS=0.5
 
@@ -78,9 +83,6 @@ export S5_SYNCNET_CROP_SCALE=0.40      # SyncNet 人脸裁剪缩放
 export S5_MIN_SPEAKERS=0               # 最少说话人数 (0=不限)
 # Audio enhance
 export S5_DISABLE_AUDIO_ENHANCE=false  # 禁用音频增强 (人声分离+降噪)
-# Semantic sync
-export S5_SEMANTIC_SYNC_THRESHOLD=0.15 # 语义同步阈值
-export S5_SEMANTIC_SYNC_MAX_FRAMES=15  # 语义同步最大帧数
 # Other
 export S5_QUALIFIED_COPY_MODE="symlink"  # 通过视频: symlink / copy / none
 export S5_RAY_NUM_GPUS=1.0

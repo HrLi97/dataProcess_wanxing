@@ -25,6 +25,9 @@ from filter.filter_utils import (
     ckps_root,
     env_or,
     worker_syspath_setup,
+    init_csv,
+    load_processed_inputs,
+    INPUT_PATH_FIELD,
 )
 
 
@@ -309,18 +312,13 @@ class Worker:
         # 不再额外加 source_video_path；video_path 表示当前处理视频的最终落点
         extra_fields = ["video_path"] + LIPSYNC_FIELDS
         self.fieldnames = list(input_fields) + [c for c in extra_fields if c not in input_fields]
-        for p in (self.all_csv, self.qual_csv):
-            if not Path(p).exists():
-                with open(p, "w", newline="", encoding="utf-8") as f:
-                    csv.DictWriter(f, fieldnames=self.fieldnames).writeheader()
-        # 断点续跑：加载 all_csv 中已处理的 video_path（输出路径即当前处理视频）
-        self.processed = set()
-        if Path(self.all_csv).exists():
-            with open(self.all_csv, encoding="utf-8-sig") as f:
-                for r in csv.DictReader(f):
-                    sv = r.get("video_path", "")
-                    if sv:
-                        self.processed.add(sv)
+        # 以文件实际表头追加（旧 CSV 缺列时原地补列）；all CSV 额外记录输入路径作断点续跑 key
+        self.csv_fields = {
+            self.all_csv: init_csv(self.all_csv, self.fieldnames + [INPUT_PATH_FIELD]),
+            self.qual_csv: init_csv(self.qual_csv, self.fieldnames),
+        }
+        # 断点续跑：按输入路径判断（video_path 是输出路径，不能当 key；旧 CSV 无该列时回退到原逻辑）
+        self.processed = load_processed_inputs(self.all_csv)
         # OBS
         self.obs_io = ObsIO(args)
         print(f"Worker initialized: lipsync models loaded. OBS={self.obs_io.enabled}. 已处理 {len(self.processed)} 条。")
@@ -328,7 +326,7 @@ class Worker:
     def _append_csv(self, filepath, row):
         with open(filepath, "a", newline="", encoding="utf-8") as f:
             fcntl.flock(f, fcntl.LOCK_EX)
-            csv.DictWriter(f, fieldnames=self.fieldnames, extrasaction="ignore").writerow(row)
+            csv.DictWriter(f, fieldnames=self.csv_fields[filepath], extrasaction="ignore").writerow(row)
             f.flush()
             fcntl.flock(f, fcntl.LOCK_UN)
 
@@ -373,7 +371,8 @@ class Worker:
                     row["video_path"] = obs_key
                     self.obs_io.cleanup(local_result)
 
-            self._append_csv(self.all_csv, row)
+            # all CSV（含拒绝行）带本步输入路径；返回给 Ray 的 row 不加列，保持各行 schema 一致
+            self._append_csv(self.all_csv, {**row, INPUT_PATH_FIELD: vid_path})
             if not row.get("lipsync_reject_reason"):
                 self._append_csv(self.qual_csv, row)
             self.processed.add(vid_path)

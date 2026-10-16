@@ -9,20 +9,43 @@ This produces a clean vocals WAV that improves downstream:
   - LR-ASD / SyncNet lip-sync scoring
   - ImageBind semantic similarity computation
 """
+import importlib.util
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from filter.filter_utils import ensure_dir, safe_name
+from filter.filter_utils import ensure_dir, safe_name, ckps_root, env_or, prepend_sys_path, pushd
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Audio separation (MelBandRoformer)
 # ──────────────────────────────────────────────────────────────────────────────
+
+def _load_msst_module(mss_root, rel_path):
+    """按文件路径加载 Music-Source-Separation-Training 里的模块（utils/settings.py、utils/model_utils.py）。
+
+    固定的 MSST 提交里没有 utils_separation 模块。MSST 的 utils/ 与 TalkNCE 的 utils/（还有项目根 utils/）
+    都是没有 __init__.py 的顶层 namespace 包，且都有 model_utils.py；同一进程里 TalkNCE 已经
+    import 了 utils.distributed，再 `from utils.xxx import ...` 会串包。这里用私有模块名加载，不碰 sys.modules["utils"]。
+    """
+    name = f"_msst_{Path(rel_path).stem}"
+    mod = sys.modules.get(name)
+    if mod is None:
+        spec = importlib.util.spec_from_file_location(name, str(Path(mss_root) / rel_path))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        try:
+            spec.loader.exec_module(mod)
+        except BaseException:
+            sys.modules.pop(name, None)
+            raise
+    return mod
+
 
 def _extract_audio_from_video(video_path, sr=44100):
     """Extract audio from video as numpy array at given sample rate."""
@@ -44,10 +67,8 @@ def _extract_audio_from_video(video_path, sr=44100):
 
 
 
-def _run_separation(model, config, mix, device, use_tta=False):
-    """Run MelBandRoformer source separation."""
-    from utils_separation import demix
-
+def _run_separation(model, config, mix, device, demix, use_tta=False):
+    """Run MelBandRoformer source separation. demix: MSST utils/model_utils.py 里的 demix。"""
     mix_orig = mix.copy()
     if config.inference.get("normalize", False):
         mono = mix.mean(0)
@@ -101,6 +122,7 @@ class AudioEnhanceRunner:
         self.device = torch.device(getattr(args, "device", "cuda:0"))
         self.model = None
         self.config = None
+        self.demix = None
         self.clearvoice = None
 
         sep_config_path = getattr(args, "audio_sep_config", "")
@@ -111,13 +133,12 @@ class AudioEnhanceRunner:
             print("[AudioEnhance] Separation model not configured, skipping init.")
             return
 
-        # Load MelBandRoformer
-        import sys
-        if mss_root and mss_root not in sys.path:
-            sys.path.insert(0, mss_root)
-        from utils_separation import get_model_from_config
-
-        model, config = get_model_from_config("mel_band_roformer", sep_config_path)
+        # Load MelBandRoformer（get_model_from_config 在 MSST utils/settings.py，demix 在 utils/model_utils.py）
+        settings = _load_msst_module(mss_root, "utils/settings.py")
+        self.demix = _load_msst_module(mss_root, "utils/model_utils.py").demix
+        # get_model_from_config 内部 `from models.bs_roformer import ...`，构建模型期间需要 MSST 根在 sys.path 最前
+        with prepend_sys_path(mss_root):
+            model, config = settings.get_model_from_config("mel_band_roformer", sep_config_path)
         state_dict = torch.load(sep_ckpt_path, map_location=self.device)
         model.load_state_dict(state_dict)
         self.model = model.to(self.device).eval()
@@ -125,12 +146,22 @@ class AudioEnhanceRunner:
         print(f"[AudioEnhance] MelBandRoformer loaded from {sep_ckpt_path}")
 
         # Load ClearVoice
-        from clearvoice.clearvoice import ClearVoice
-        self.clearvoice = ClearVoice(
-            task="speech_enhancement",
-            model_names=["MossFormer2_SE_48K"],
-        )
-        print("[AudioEnhance] ClearVoice (MossFormer2_SE_48K) loaded.")
+        try:
+            from clearvoice.clearvoice import ClearVoice  # 源码仓库布局（原写法）
+        except ImportError:
+            from clearvoice import ClearVoice  # pip 包 clearvoice 0.1.x：ClearVoice 定义在包 __init__ 里
+        # ClearVoice 按 yaml 里的相对路径 checkpoints/MossFormer2_SE_48K（相对当前工作目录）找权重；找不到会
+        # 尝试联网下载，失败只打 warning、模型保持随机初始化。这里先确认权重存在，再切到 CLEARVOICE_DIR 下构建。
+        clearvoice_dir = env_or("CLEARVOICE_DIR", ckps_root() / "clearvoice")
+        best_ckpt = clearvoice_dir / "checkpoints" / "MossFormer2_SE_48K" / "last_best_checkpoint"
+        if not best_ckpt.is_file():
+            raise FileNotFoundError(f"[AudioEnhance] ClearVoice 权重不存在: {best_ckpt}（检查 CLEARVOICE_DIR）")
+        with pushd(clearvoice_dir):
+            self.clearvoice = ClearVoice(
+                task="speech_enhancement",
+                model_names=["MossFormer2_SE_48K"],
+            )
+        print(f"[AudioEnhance] ClearVoice (MossFormer2_SE_48K) loaded from {clearvoice_dir}.")
 
 
     @property
@@ -162,7 +193,7 @@ class AudioEnhanceRunner:
 
         # Step 2: Source separation
         sep_result = _run_separation(
-            self.model, self.config, mix, self.device,
+            self.model, self.config, mix, self.device, self.demix,
             use_tta=getattr(self.args, "audio_sep_tta", False),
         )
 

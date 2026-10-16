@@ -20,7 +20,9 @@ _FILTER_ROOT = str(Path(__file__).resolve().parents[1])
 if _FILTER_ROOT not in sys.path:
     sys.path.insert(0, _FILTER_ROOT)
 
-from filter.filter_utils import unique_output_name, worker_syspath_setup
+from filter.filter_utils import (
+    unique_output_name, worker_syspath_setup, init_csv, load_processed_inputs, INPUT_PATH_FIELD,
+)
 from filter.obs_helper import add_obs_args, ObsIO
 
 
@@ -653,7 +655,7 @@ def compute_flow_magnitude(model, frame1, frame2, iters=20):
     return float(np.mean(mag))
 
 
-def compute_motion_score(model, video_path, sampling_fps=2, iters=20, max_size=512):
+def compute_motion_score(model, video_path, sampling_fps=2, iters=20, max_size=512, cut_frames=()):
     """
     使用 RAFT 光流计算视频运动分数。
 
@@ -663,6 +665,9 @@ def compute_motion_score(model, video_path, sampling_fps=2, iters=20, max_size=5
         - 2.0 ~ 6.0: 中等动态（正常视频）
         - 6.0 ~ 15.0: 高动态（运动场景、快速镜头）
         - > 15.0: 极高动态（剧烈抖动、场景频繁切换）
+
+    cut_frames: 多镜头片段的切点帧号（Step 2 的 cut_frames）。跨切点的那对采样帧不算光流，
+    否则镜头切换会被当成剧烈运动。
 
     Returns:
         dict: {"motion_score": float, "frame_scores": list} 或 None
@@ -684,6 +689,7 @@ def compute_motion_score(model, video_path, sampling_fps=2, iters=20, max_size=5
     frame_interval = max(1, int(fps / min(max(sampling_fps, 1), fps)))
     frame_scores = []
     prev_frame = None
+    prev_idx = -1
     frame_count = -1
 
     while cap.isOpened():
@@ -699,8 +705,8 @@ def compute_motion_score(model, video_path, sampling_fps=2, iters=20, max_size=5
             scale = max_size / max(h, w)
             frame = cv2.resize(frame, (int(w * scale), int(h * scale)))
 
-        if prev_frame is None:
-            prev_frame = frame
+        if prev_frame is None or any(prev_idx < c <= frame_count for c in cut_frames):
+            prev_frame, prev_idx = frame, frame_count
             continue
 
         try:
@@ -709,7 +715,7 @@ def compute_motion_score(model, video_path, sampling_fps=2, iters=20, max_size=5
         except Exception as e:
             print(f"  光流计算异常: {e}")
 
-        prev_frame = frame
+        prev_frame, prev_idx = frame, frame_count
 
     cap.release()
     if not frame_scores:
@@ -724,6 +730,16 @@ def compute_motion_score(model, video_path, sampling_fps=2, iters=20, max_size=5
 # ─── CSV Pipeline ────────────────────────────────────────────────────────────
 
 MOTION_FIELDS = ["motion_reject_reason", "motion_score"]
+
+
+def parse_cut_frames(value):
+    """Step 2 的 cut_frames 列（"52;97"）→ [52, 97]。空值、NaN 返回 []；
+    整列只有单个切点时 pandas/Ray 会把它读成数字，也要认。"""
+    if isinstance(value, (int, float)):
+        return [] if value != value else [int(value)]  # value != value 即 NaN
+    if not isinstance(value, str) or not value.strip():
+        return []
+    return [int(float(x)) for x in value.split(";") if x.strip()]
 
 
 def process_segment(args, model, item, qualified_dir):
@@ -756,6 +772,7 @@ def process_segment(args, model, item, qualified_dir):
         sampling_fps=args.sampling_fps,
         iters=args.raft_iters,
         max_size=args.max_size,
+        cut_frames=parse_cut_frames(item.get("cut_frames")),
     )
     if result is None:
         row["motion_reject_reason"] = "compute_failed"
@@ -798,18 +815,13 @@ class Worker:
             input_fields = csv.DictReader(f).fieldnames or []
         # 不再额外加 source_video_path；video_path 表示当前处理视频的路径
         self.fieldnames = list(input_fields) + [c for c in ["video_path"] + MOTION_FIELDS if c not in input_fields]
-        for p in (self.all_csv, self.qual_csv):
-            if not p.exists():
-                with open(p, "w", newline="", encoding="utf-8") as f:
-                    csv.DictWriter(f, fieldnames=self.fieldnames).writeheader()
-        # 断点续跑：加载已处理的 video_path（输出路径就是当前处理视频的最终落点）
-        self.processed = set()
-        if self.all_csv.exists():
-            with open(self.all_csv, encoding="utf-8") as f:
-                for r in csv.DictReader(f):
-                    vp = r.get("video_path", "")
-                    if vp:
-                        self.processed.add(vp)
+        # 以文件实际表头追加（旧 CSV 缺列时原地补列）；all CSV 额外记录输入路径作断点续跑 key
+        self.csv_fields = {
+            self.all_csv: init_csv(self.all_csv, self.fieldnames + [INPUT_PATH_FIELD]),
+            self.qual_csv: init_csv(self.qual_csv, self.fieldnames),
+        }
+        # 断点续跑：按输入路径判断（video_path 是输出路径，不能当 key；旧 CSV 无该列时回退到原逻辑）
+        self.processed = load_processed_inputs(self.all_csv)
         print(f"加载 RAFT 模型: {args.raft_model}")
         self.model = load_raft_model(args.raft_model, small=args.raft_small)
         # OBS
@@ -819,7 +831,7 @@ class Worker:
     def _append_csv(self, filepath, row):
         with open(filepath, "a", newline="", encoding="utf-8") as f:
             fcntl.flock(f, fcntl.LOCK_EX)
-            csv.DictWriter(f, fieldnames=self.fieldnames, extrasaction="ignore").writerow(row)
+            csv.DictWriter(f, fieldnames=self.csv_fields[filepath], extrasaction="ignore").writerow(row)
             f.flush()
             fcntl.flock(f, fcntl.LOCK_UN)
 
@@ -857,7 +869,8 @@ class Worker:
                     row["video_path"] = obs_key
                     self.obs_io.cleanup(local_result)
 
-            self._append_csv(self.all_csv, row)
+            # all CSV（含拒绝行）带本步输入路径；返回给 Ray 的 row 不加列，保持各行 schema 一致
+            self._append_csv(self.all_csv, {**row, INPUT_PATH_FIELD: seg_path})
             if not row.get("motion_reject_reason"):
                 self._append_csv(self.qual_csv, row)
             self.processed.add(seg_path)
@@ -876,8 +889,8 @@ parser.add_argument("--video_path_column", default="video_path")
 parser.add_argument("--raft_model", default=RAFT_CKPT_DEFAULT)
 parser.add_argument("--raft_small", action="store_true")
 parser.add_argument("--raft_iters", type=int, default=20)
-parser.add_argument("--min_motion", type=float, default=10)
-parser.add_argument("--max_motion", type=float, default=200)
+parser.add_argument("--min_motion", type=float, default=0.02)  # 只去掉完全不动的画面（对话特写也只有 0.04–0.4）
+parser.add_argument("--max_motion", type=float, default=100)  # 只去掉极端乱晃、闪烁（手持动作戏 65–84）
 parser.add_argument("--sampling_fps", type=int, default=2)
 parser.add_argument("--max_size", type=int, default=512)
 parser.add_argument("--copy_mode", choices=["symlink", "copy", "none"], default="symlink")

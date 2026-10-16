@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import fcntl
+import math
 import os
 import sys
 import warnings
@@ -19,7 +20,7 @@ _FILTER_ROOT = Path(__file__).resolve().parents[1]
 if str(_FILTER_ROOT) not in sys.path:
     sys.path.insert(0, str(_FILTER_ROOT))
 
-from filter.filter_utils import project_root, ckps_root, env_or, worker_syspath_setup  # noqa: E402
+from filter.filter_utils import project_root, ckps_root, env_or, worker_syspath_setup, init_csv  # noqa: E402
 from filter.obs_helper import add_obs_args, ObsIO  # noqa: E402
 
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -128,13 +129,18 @@ def load_dover(
     cfg = Path(cfg_path) if cfg_path else _DOVER_ROOT / "dover.yml"
     with open(cfg) as f:
         opt = yaml.safe_load(f)
+    # 官方 dover.yml 的采样配置在 data.<数据集>.args.sample_types 下（官方推理脚本取 val-l1080p），不在顶层
+    if "sample_types" not in opt:
+        data = opt.get("data", {})
+        src = data.get("val-l1080p") or next(iter(data.values()))
+        opt["sample_types"] = src["args"]["sample_types"]
 
     model = DOVER(**opt["model"]["args"]).to(device)
 
     pth = Path(weight_path) if weight_path else _DOVER_ROOT / opt["test_load_path"].lstrip("./")
     if not pth.exists():
-        print(f"[DOVER] 权重不存在: {pth}，跳过")
-        return None
+        # fail closed：启用了 DOVER 却没有权重时直接报错，不再静默跳过（导致不打 DOVER 分就放行）
+        raise FileNotFoundError(f"[DOVER] 权重不存在: {pth}（如需跳过 DOVER 请加 --no-dover）")
     model.load_state_dict(torch.load(str(pth), map_location=device))
     model.eval()
     print(f"[DOVER] 加载成功  ({pth.name})")
@@ -294,8 +300,7 @@ def load_kvq(
         pth_rel = config.get("test_load_path", "weights/KVQ.pth")
         pth = Path(weight_path) if weight_path else _KVQ_ROOT / pth_rel.lstrip("./")
         if not pth.exists():
-            print(f"[KVQ] 权重不存在: {pth}，跳过")
-            return None
+            raise FileNotFoundError(f"权重不存在: {pth}")
 
         data_cfg = config.get("data", {})
         split_key = next(iter(data_cfg))
@@ -338,8 +343,8 @@ def load_kvq(
             "device": device,
         }
     except Exception as e:
-        print(f"[KVQ] 加载失败: {e}")
-        return None
+        # fail closed：启用了 KVQ 却加载失败时在 worker 启动阶段直接报错，不再返回 None 静默跳过
+        raise RuntimeError(f"[KVQ] 加载失败: {e}（如需跳过 KVQ 请加 --no-kvq）") from e
 
 
 _KVQ_MEAN = torch.FloatTensor([123.675, 116.28, 103.53])
@@ -395,7 +400,20 @@ def kvq_score(video_path: str, state: Dict) -> Dict[str, float]:
 QUALITY_FIELDS = [
     "dover_overall", "aes_mean", "kvq_score",
     "quality_reject_reason",
+    # OCR 结果（process_segment 中计算；此前不在表头，被 extrasaction="ignore" 丢弃）
+    "ocr_has_subtitle", "ocr_subtitle_area_ratio", "ocr_frame_consistency", "ocr_avg_text_area_ratio",
 ]
+
+
+def _metric(tag: str, fn, key: str, *fn_args, **fn_kwargs) -> float:
+    """调用打分函数取 key 对应的分数（保留 6 位）。
+    抛异常或得到非有限值（NaN / inf）时统一返回 NaN，由调用方按 {tag}_error 拒绝（fail closed）。"""
+    try:
+        v = float(fn(*fn_args, **fn_kwargs)[key])
+    except Exception as e:
+        print(f"  [{tag}] 打分异常: {e}")
+        return float("nan")
+    return round(v, 6) if math.isfinite(v) else float("nan")
 
 
 def process_segment(args, item, worker):
@@ -407,6 +425,8 @@ def process_segment(args, item, worker):
       - ocr_subtitle_a{area_ratio}     字幕面积比超过 --max_subtitle_area_ratio
       - ocr_error                      OCR 推理异常
       - ocr_engine_missing             启用了 OCR 但引擎未初始化
+      - dover_error / aes_error / kvq_error
+                                       对应模型打分抛异常或返回 NaN（fail closed，不放行）
     """
     row = dict(item)
     for k in QUALITY_FIELDS:
@@ -454,34 +474,41 @@ def process_segment(args, item, worker):
         print(f"  不通过(OCR): {Path(video_path).name} | {row['quality_reject_reason']}")
         return row
 
-    # ── 2) DOVER ──
+    # ── 2) DOVER ──（打分异常 / NaN → dover_error；此前 nan < 阈值 为 False 会被放行）
     if worker.dover_state:
-        d = dover_score(video_path, worker.dover_state)
-        row["dover_overall"] = round(d["overall"], 6)
-        if args.min_dover_overall > 0 and row["dover_overall"] < args.min_dover_overall:
+        row["dover_overall"] = _metric("DOVER", dover_score, "overall", video_path, worker.dover_state)
+        if math.isnan(row["dover_overall"]):
+            reasons.append("dover_error")
+        elif args.min_dover_overall > 0 and row["dover_overall"] < args.min_dover_overall:
             reasons.append(f"dover_low_{row['dover_overall']}")
+        if reasons:
             row["quality_reject_reason"] = ",".join(reasons)
-            print(f"  不通过(DOVER): {Path(video_path).name}")
+            print(f"  不通过(DOVER): {Path(video_path).name} | {row['quality_reject_reason']}")
             return row
 
     # ── 3) AesV25 ──
     if worker.aes_state:
-        a = aes_v25_score(video_path, worker.aes_state, n_frames=args.aes_frames)
-        row["aes_mean"] = round(a["aes_mean"], 6)
-        if args.min_aes_mean > 0 and row["aes_mean"] < args.min_aes_mean:
+        row["aes_mean"] = _metric("AES", aes_v25_score, "aes_mean",
+                                  video_path, worker.aes_state, n_frames=args.aes_frames)
+        if math.isnan(row["aes_mean"]):
+            reasons.append("aes_error")
+        elif args.min_aes_mean > 0 and row["aes_mean"] < args.min_aes_mean:
             reasons.append(f"aes_low_{row['aes_mean']}")
+        if reasons:
             row["quality_reject_reason"] = ",".join(reasons)
-            print(f"  不通过(AES): {Path(video_path).name}")
+            print(f"  不通过(AES): {Path(video_path).name} | {row['quality_reject_reason']}")
             return row
 
     # ── 4) KVQ ──
     if worker.kvq_state:
-        k = kvq_score(video_path, worker.kvq_state)
-        row["kvq_score"] = round(k["kvq_score"], 6)
-        if args.min_kvq_score > 0 and row["kvq_score"] < args.min_kvq_score:
+        row["kvq_score"] = _metric("KVQ", kvq_score, "kvq_score", video_path, worker.kvq_state)
+        if math.isnan(row["kvq_score"]):
+            reasons.append("kvq_error")
+        elif args.min_kvq_score > -1 and row["kvq_score"] < args.min_kvq_score:  # KVQ 分数可以是负数，-1 以下视为关闭
             reasons.append(f"kvq_low_{row['kvq_score']}")
+        if reasons:
             row["quality_reject_reason"] = ",".join(reasons)
-            print(f"  不通过(KVQ): {Path(video_path).name}")
+            print(f"  不通过(KVQ): {Path(video_path).name} | {row['quality_reject_reason']}")
             return row
 
     if reasons:
@@ -503,10 +530,8 @@ class Worker:
         with open(args.input_csv, encoding="utf-8") as f:
             input_fields = csv.DictReader(f).fieldnames or []
         self.fieldnames = list(input_fields) + [c for c in QUALITY_FIELDS if c not in input_fields]
-        for p in (self.all_csv, self.qual_csv):
-            if not p.exists():
-                with open(p, "w", newline="", encoding="utf-8") as f:
-                    csv.DictWriter(f, fieldnames=self.fieldnames).writeheader()
+        # 以文件实际表头追加：旧 CSV 缺新列（ocr_*）时原地补列，避免追加行错位
+        self.csv_fields = {p: init_csv(p, self.fieldnames) for p in (self.all_csv, self.qual_csv)}
         # 断点续跑：加载已处理的 video_path（输入行里 video_path 字段是源视频路径）
         self.processed = set()
         if self.all_csv.exists():
@@ -564,7 +589,7 @@ class Worker:
     def _append_csv(self, filepath, row):
         with open(filepath, "a", newline="", encoding="utf-8") as f:
             fcntl.flock(f, fcntl.LOCK_EX)
-            csv.DictWriter(f, fieldnames=self.fieldnames, extrasaction="ignore").writerow(row)
+            csv.DictWriter(f, fieldnames=self.csv_fields[filepath], extrasaction="ignore").writerow(row)
             f.flush()
             fcntl.flock(f, fcntl.LOCK_UN)
 
@@ -654,9 +679,9 @@ parser.add_argument("--min_ocr_consistency",       type=float, default=0.5,help=
 parser.add_argument("--max_subtitle_area_ratio",   type=float, default=0.0,help="过滤后字幕面积均值上限, >0 时启用; 0 表示不按面积过滤")
 
 # 质量阈值（默认 0 表示不过滤）
-parser.add_argument("--min_dover_overall", type=float, default=0.4)
-parser.add_argument("--min_aes_mean", type=float, default=4.2)
-parser.add_argument("--min_kvq_score", type=float, default=0.008)
+parser.add_argument("--min_dover_overall", type=float, default=0.23)  # CineDance 实测约 p10
+parser.add_argument("--min_aes_mean", type=float, default=3.5)  # CineDance 实测约 p10
+parser.add_argument("--min_kvq_score", type=float, default=-0.004)  # CineDance 实测约 p10；KVQ 可为负，≤ -1 关闭
 
 # OBS
 add_obs_args(parser)

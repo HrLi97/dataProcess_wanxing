@@ -23,7 +23,7 @@ _FILTER_ROOT = str(Path(__file__).resolve().parents[1])
 if _FILTER_ROOT not in sys.path:
     sys.path.insert(0, _FILTER_ROOT)
 
-from filter.filter_utils import unique_output_name, safe_name
+from filter.filter_utils import unique_output_name, safe_name, init_csv, load_processed_inputs, INPUT_PATH_FIELD
 from filter.obs_helper import add_obs_args, ObsIO
 
 # ── 将 OmniShotCut 项目根目录加入 sys.path ──
@@ -46,6 +46,8 @@ logger = logging.getLogger(__name__)
 CUTSHOT_FIELDS = [
     "video_path", "duration_frames","transition_type",
     "is_clean_shot", "cutshot_reject_reason",
+    "num_shots", "cut_frames",  # 多镜头片段：镜头数、片段内切点（相对片段第 0 帧，分号分隔；单镜头为空）
+    "source_path", "clip_start_sec", "clip_end_sec",  # 原始视频（Step 1 的 _source_key）和片段在其中的起止秒，用来对回原片标注
 ]
 
 
@@ -53,8 +55,24 @@ def safe_name(text):
     return re.sub(r"[^0-9A-Za-z._-]+", "_", str(text)).strip("_")
 
 
-def write_segment_video(video_path, scene, output_dir, fps):
-    """用 ffmpeg 直接切割视频片段（无需逐帧重编码，速度快）。"""
+def parse_crop(value):
+    """Step 1 写的 crop 列（w:h:x:y）→ (w, h, x, y)；空值、NaN（pandas/Ray 读空列）或格式不对时返回 None（不裁）。"""
+    if not isinstance(value, str) or value.count(":") != 3:
+        return None
+    try:
+        w, h, x, y = (int(v) for v in value.split(":"))
+    except ValueError:
+        return None
+    return (w, h, x, y) if w > 0 and h > 0 and x >= 0 and y >= 0 else None
+
+
+def write_segment_video(video_path, scene, output_dir, fps, crop=None):
+    """用 ffmpeg 切出片段并重编码（libx264 CRF18，8-bit yuv420p）。
+
+    视频用 -frames:v 保证正好 frame_count 帧（H3 要求 17n+5 帧）；只取第一条视频轨和第一条音轨（可无），
+    音频按 --audio_sr / --audio_channels 统一（默认 32 kHz 立体声，H3 音频 VAE 的格式）。
+    crop=(w, h, x, y) 时同时裁掉黑边（Step 1 检测），不多一次编码。
+    """
     base_name = os.path.splitext(os.path.basename(video_path))[0]
     # 目录名加源视频 hash 短码，避免不同源同名时在 segments/ 下目录冲突
     src_tag = unique_output_name(video_path, suffix="").rsplit("__", 1)[-1]
@@ -76,15 +94,24 @@ def write_segment_video(video_path, scene, output_dir, fps):
 
     actual_fps = fps if fps and fps > 0 else 25.0
     start_sec = start_frame / actual_fps
-    duration_sec = frame_count / actual_fps
+    # 多给半帧时长，由 -frames:v 精确截到 frame_count 帧（只用 -t 时可能少 1 帧）
+    duration_sec = (frame_count + 0.5) / actual_fps
 
+    audio_opts = ["-c:a", "aac", "-b:a", "192k"]
+    if args.audio_sr > 0:
+        audio_opts += ["-ar", str(args.audio_sr)]
+    if args.audio_channels > 0:
+        audio_opts += ["-ac", str(args.audio_channels)]
     cmd = [
         "ffmpeg", "-y",
         "-ss", f"{start_sec:.4f}",
         "-i", video_path,
         "-t", f"{duration_sec:.4f}",
-        "-c:v", "libx264", "-crf", "18",
-        "-c:a", "aac",
+        "-map", "0:v:0", "-map", "0:a:0?",
+        "-frames:v", str(frame_count),
+        *(["-vf", "crop={}:{}:{}:{}".format(*crop)] if crop else []),
+        "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
+        *audio_opts,
         "-loglevel", "error",
         out_path,
     ]
@@ -99,8 +126,15 @@ def write_segment_video(video_path, scene, output_dir, fps):
     return {"segment_video_path": "", "status": False}
 
 
-TARGET_FRAME_COUNT = 121
+TARGET_FRAME_COUNT = 124  # 由 --clip_frames 覆盖；H3 默认 124 帧 = 17*7+5（5.17 s @ 24 fps）
+TRIM_FRAMES = 3  # 由 --trim_frames 覆盖：每个镜头两端各裁掉的帧数，避开切点附近的闪帧和过渡帧
+MIN_SHOT_FRAMES = 12  # 由 --min_shot_frames 覆盖：多镜头片段里每个镜头（含被片段截断的首尾两段）至少几帧
+MAX_SHOTS = 4  # 由 --max_shots 覆盖：多镜头片段最多几个镜头（H3 团队 prompt 校验的上限也是 4）
+
+
 def _split_fragment(fragment_start, fragment_end):
+    fragment_start += TRIM_FRAMES
+    fragment_end -= TRIM_FRAMES
     dur = fragment_end - fragment_start
     if dur < TARGET_FRAME_COUNT:
         return []
@@ -115,6 +149,67 @@ def _split_fragment(fragment_start, fragment_end):
         pos += TARGET_FRAME_COUNT
 
     return results
+
+
+def _first_problem_jump(bounds):
+    """片段内镜头边界 [起点, 切点…, 终点] 有问题时，返回下一次开窗的起点；没问题返回 None。"""
+    n = len(bounds) - 1  # 镜头数
+    for k in range(n):
+        if bounds[k + 1] - bounds[k] < MIN_SHOT_FRAMES:
+            cut = bounds[k + 1] if k + 1 < n else bounds[k]  # 末段过短时，问题出在它前面那个切点
+            return cut + TRIM_FRAMES
+    if n > MAX_SHOTS:
+        return bounds[1] + TRIM_FRAMES
+    return None
+
+
+def _multi_shot_windows(ranges, intra_labels, inter_labels, inter_names, general_idx):
+    """多镜头模式：把硬切相接的 general 段连成一段（run），在 run 里按 TARGET_FRAME_COUNT 连续开窗，窗口可以跨硬切。
+
+    转场段（叠化、划像等）和 Transition / Transition_Source / Padding 边界会打断 run。窗口两端离 run 边界至少
+    TRIM_FRAMES 帧；窗口里每个镜头至少 MIN_SHOT_FRAMES 帧（所以切点也离窗口两端至少这么远），镜头数不超过
+    MAX_SHOTS；不满足就把窗口起点挪到出问题的切点之后再试。
+    """
+    runs, cur = [], None
+    for (s, e), intra, inter in zip(ranges, intra_labels, inter_labels):
+        s, e = int(s), int(e)
+        name = inter_names.get(int(inter), str(inter))
+        if int(intra) != general_idx or name in ("Transition", "Transition_Source", "Padding"):
+            if cur:
+                runs.append(cur)
+            cur = None
+            continue
+        if cur and s == cur["end"]:  # 和上一段硬切相接
+            cur["cuts"].append(s)
+            cur["end"] = e
+        else:
+            if cur:
+                runs.append(cur)
+            cur = {"start": s, "end": e, "cuts": [], "type": name}
+    if cur:
+        runs.append(cur)
+
+    scenes = []
+    for run in runs:
+        pos, stop = run["start"] + TRIM_FRAMES, run["end"] - TRIM_FRAMES
+        while pos + TARGET_FRAME_COUNT <= stop:
+            end = pos + TARGET_FRAME_COUNT
+            inner = [c for c in run["cuts"] if pos < c < end]
+            jump = _first_problem_jump([pos] + inner + [end])
+            if jump is not None:
+                pos = jump
+                continue
+            scenes.append({
+                "start_frame": pos,
+                "end_frame": end,
+                "duration_frames": TARGET_FRAME_COUNT,
+                "transition_type": f"{len(inner) + 1}shot",
+                "is_clean_shot": True,
+                "num_shots": len(inner) + 1,
+                "cut_frames": [c - pos for c in inner],
+            })
+            pos = end
+    return scenes
 
 
 # ────────────────────── 核心推理函数 ──────────────────────
@@ -135,6 +230,14 @@ def run_scene_detection(video_path, model, model_args, num_context_frames,
     print(f"[DEBUG] pred_ranges ({len(pred_ranges)}): {pred_ranges}")
     print(f"[DEBUG] pred_intra_labels: {pred_intra_labels}")
     print(f"[DEBUG] pred_inter_labels: {pred_inter_labels}")
+
+    if mode == "multi_shot":
+        scenes = _multi_shot_windows(pred_ranges, pred_intra_labels, pred_inter_labels, inter_int2string,
+                                     unique_intra_label_mapping["general"])
+        print(f"[DEBUG] multi_shot windows: {len(scenes)}")
+        for sc in scenes:
+            print(f"  [{sc['start_frame']:>5d} - {sc['end_frame']:>5d}] shots={sc['num_shots']} cuts={sc['cut_frames']}")
+        return scenes, fps
 
     if mode == "clean_shot":
         general_idx = unique_intra_label_mapping["general"]
@@ -176,12 +279,8 @@ def run_scene_detection(video_path, model, model_args, num_context_frames,
             scenes.append(sc)
             continue
 
-        # 所有 clean shot 统一走固定 121 帧切分
+        # 所有 clean shot 统一先裁两端 TRIM_FRAMES，再切成固定 TARGET_FRAME_COUNT 帧
         dur = sc["duration_frames"]
-        if dur == TARGET_FRAME_COUNT:
-            scenes.append(sc)
-            continue
-
         sub_fragments = _split_fragment(sc["start_frame"], sc["end_frame"])
         if not sub_fragments:
             print(f"  [SKIP] [{sc['start_frame']}-{sc['end_frame']}] dur={dur} < {TARGET_FRAME_COUNT}, dropped")
@@ -205,7 +304,7 @@ def run_scene_detection(video_path, model, model_args, num_context_frames,
     return scenes, fps
 
 
-def cut_scenes_to_video(video_path, scenes, fps, output_dir):
+def cut_scenes_to_video(video_path, scenes, fps, output_dir, crop=None):
     rows = []
     for sc in scenes:
         write_info = {
@@ -214,7 +313,7 @@ def cut_scenes_to_video(video_path, scenes, fps, output_dir):
         }
         if sc.get("is_clean_shot"):
             try:
-                write_info = write_segment_video(video_path, sc, output_dir, fps)
+                write_info = write_segment_video(video_path, sc, output_dir, fps, crop=crop)
             except Exception as e:
                 write_info = {
                     "segment_video_path": "",
@@ -251,7 +350,8 @@ def process_single_video(video_path, model, model_args, opt, input_item):
             "cutshot_reject_reason": "detection_failed",
         }]
 
-    segment_rows = cut_scenes_to_video(video_path, scenes, fps, opt.output_dir)
+    crop = parse_crop((input_item or {}).get("crop"))
+    segment_rows = cut_scenes_to_video(video_path, scenes, fps, opt.output_dir, crop=crop)
 
     out_rows = []
     for seg_row in segment_rows:
@@ -260,6 +360,11 @@ def process_single_video(video_path, model, model_args, opt, input_item):
             "duration_frames": seg_row.get("duration_frames", ""),
             "transition_type": seg_row.get("transition_type", ""),
             "is_clean_shot": seg_row.get("is_clean_shot", False),
+            "num_shots": seg_row.get("num_shots", 1),
+            "cut_frames": ";".join(str(c) for c in seg_row.get("cut_frames", [])),
+            "source_path": (input_item or {}).get("_source_key") or video_path,
+            "clip_start_sec": round(int(seg_row["start_frame"]) / fps, 4) if fps else "",
+            "clip_end_sec": round(int(seg_row["end_frame"]) / fps, 4) if fps else "",
         }
         if not seg_row.get("is_clean_shot"):
             row["cutshot_reject_reason"] = "not_clean_shot"
@@ -293,6 +398,11 @@ class Worker:
 
         os.chdir(OMNISHOTCUT_ROOT)
         sys.path.insert(0, OMNISHOTCUT_ROOT)
+        # torch>=2.6 起 torch.load 默认 weights_only=True；OmniShotCut ckpt 的 state_dict["args"] 是 argparse.Namespace，
+        # 不加白名单的话 third_part/OmniShotCut/test_code/inference.py 里的 torch.load 会抛 UnpicklingError
+        import torch
+        if hasattr(torch.serialization, "add_safe_globals"):
+            torch.serialization.add_safe_globals([argparse.Namespace])
         from test_code.inference import load_model
         self.model, self.model_args = load_model(args.checkpoint_path)
         # 初始化输出
@@ -301,18 +411,13 @@ class Worker:
         self.all_csv = os.path.join(self.output_dir, "2_cutshot_all.csv")
         self.qual_csv = os.path.join(self.output_dir, "2_cutshot_qualified.csv")
         self.fieldnames = list(CUTSHOT_FIELDS)
-        for p in (self.all_csv, self.qual_csv):
-            if not os.path.exists(p):
-                with open(p, "w", newline="", encoding="utf-8") as f:
-                    csv.DictWriter(f, fieldnames=self.fieldnames).writeheader()
-        # 断点续跑：加载已处理的 video_path
-        self.processed = set()
-        if os.path.exists(self.all_csv):
-            with open(self.all_csv, encoding="utf-8") as f:
-                for r in csv.DictReader(f):
-                    sv = r.get("video_path", "")
-                    if sv:
-                        self.processed.add(sv)
+        # 以文件实际表头追加（旧 CSV 缺列时原地补列）；all CSV 额外记录输入路径作断点续跑 key
+        self.csv_fields = {
+            self.all_csv: init_csv(self.all_csv, self.fieldnames + [INPUT_PATH_FIELD]),
+            self.qual_csv: init_csv(self.qual_csv, self.fieldnames),
+        }
+        # 断点续跑：按输入路径判断（旧 CSV 无 input_video_path 列时回退到原 video_path 逻辑）
+        self.processed = load_processed_inputs(self.all_csv)
         # OBS
         self.obs_io = ObsIO(args)
         logger.info(f"Worker initialized: OmniShotCut model loaded. OBS={self.obs_io.enabled}. 已处理 {len(self.processed)} 条。")
@@ -320,7 +425,7 @@ class Worker:
     def _append_csv(self, filepath, row):
         with open(filepath, "a", newline="", encoding="utf-8") as f:
             fcntl.flock(f, fcntl.LOCK_EX)
-            csv.DictWriter(f, fieldnames=self.fieldnames, extrasaction="ignore").writerow(row)
+            csv.DictWriter(f, fieldnames=self.csv_fields[filepath], extrasaction="ignore").writerow(row)
             f.flush()
             fcntl.flock(f, fcntl.LOCK_UN)
 
@@ -343,6 +448,10 @@ class Worker:
                 local_video = vid_path
 
             rows = process_single_video(local_video, self.model, self.model_args, args, item)
+            if not rows:
+                # 一个 segment 都没切出（如 clean shot 全部短于 TARGET_FRAME_COUNT 被丢弃）也记一行，续跑时不再重算
+                rows = [{"video_path": "", "duration_frames": "", "transition_type": "",
+                         "is_clean_shot": False, "cutshot_reject_reason": "no_segments"}]
 
             # ── OBS: 上传切割出的合格 segment，CSV 写 obs_key ──
             if self.obs_io.enabled:
@@ -357,7 +466,8 @@ class Worker:
                         self.obs_io.cleanup(local_seg)
 
             for row in rows:
-                self._append_csv(self.all_csv, row)
+                # all CSV 每行（含拒绝行）带本步输入路径；返回给 Ray 的 row 不加列，保持各行 schema 一致
+                self._append_csv(self.all_csv, {**row, INPUT_PATH_FIELD: vid_path})
                 if not row.get("cutshot_reject_reason"):
                     self._append_csv(self.qual_csv, row)
             self.processed.add(vid_path)
@@ -386,8 +496,16 @@ parser.add_argument("--input_csv", type=str, default="/mnt/workspace/lihaoran/da
 parser.add_argument("--output_dir", type=str, default="/mnt/workspace/lihaoran/data_process/test/result/0618/filter_shotcut/no_pepole/", help="输出根目录")
 parser.add_argument("--video_path_column", type=str, default="video_path", help="输入 CSV 中视频路径列名")
 parser.add_argument("--checkpoint_path", type=str, default=os.path.join(OMNISHOTCUT_ROOT, "checkpoints", "OmniShotCut_ckpt.pth"))
-parser.add_argument("--mode", type=str, default="clean_shot", choices=["default", "clean_shot"], help="clean_shot 只保留 general 硬切镜头")
+parser.add_argument("--mode", type=str, default="multi_shot", choices=["default", "clean_shot", "multi_shot"],
+                    help="clean_shot：片段只取单个镜头内部；multi_shot：片段可以跨硬切（H3 支持多镜头描述），切点写进 cut_frames")
+parser.add_argument("--min_shot_frames", type=int, default=12, help="multi_shot：片段里每个镜头至少几帧")
+parser.add_argument("--max_shots", type=int, default=4, help="multi_shot：一个片段最多几个镜头")
 parser.add_argument("--num_context_frames", type=int, default=5, help="上下文帧数")
+parser.add_argument("--clip_frames", type=int, default=124,
+                    help="每个片段的帧数；MiniMax-H3 要求 17n+5（如 73、124、141、192）")
+parser.add_argument("--trim_frames", type=int, default=3, help="每个镜头两端各裁掉的帧数")
+parser.add_argument("--audio_sr", type=int, default=32000, help="片段音频采样率，0=保留源采样率；H3 为 32000")
+parser.add_argument("--audio_channels", type=int, default=2, help="片段音频声道数，0=保留源声道；H3 为立体声")
 
 # OBS
 add_obs_args(parser)
@@ -398,6 +516,12 @@ parser.add_argument("--ray_num_gpus", type=float, default=0.5)
 parser.add_argument("--ray_num_cpus", type=float, default=0)
 parser.add_argument("--concurrency", type=int, default=4, help="Ray 并发数")
 args = parser.parse_args()
+TARGET_FRAME_COUNT = args.clip_frames
+TRIM_FRAMES = args.trim_frames
+MIN_SHOT_FRAMES = args.min_shot_frames
+MAX_SHOTS = args.max_shots
+if (TARGET_FRAME_COUNT - 5) % 17 != 0:
+    print(f"[WARN] --clip_frames {TARGET_FRAME_COUNT} 不是 17n+5，MiniMax-H3 的视频 VAE 不能直接编码这个帧数")
 
 # ────────────────────────── main ──────────────────────────
 if __name__ == "__main__":
