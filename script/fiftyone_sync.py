@@ -125,15 +125,59 @@ def sync(fo, name, root):
                 continue
             s = fo.Sample(filepath=rec["filepath"])
             for k, v in rec.items():
-                if k != "filepath" and v is not None:
-                    s[k] = v
+                if k != "filepath":
+                    s[k] = v  # None 也写，重新同步时清掉旧值（比如之前被拒、修补后通过的片段）
             tags = [rec.get("status", "")] if ds_name == name else (["rejected"] if rec.get("step1_reject") else ["kept"])
             s.tags = [t for t in tags if t]
             samples.append(s)
         if samples:
             ds.merge_samples(samples, key_field="filepath", insert_new=True, overwrite=True)
         print(f"[{time.strftime('%H:%M:%S')}] {ds_name}: {len(ds)} 个样本")
+    sync_first_frames(fo, name, clips)
+    ensure_views(fo, name)
     return fo.load_dataset(name)
+
+
+def sync_first_frames(fo, name, clips):
+    """<name>_firstframes：最终合格样本的首帧图片，带描述和片段路径，方便一屏看很多首帧、点开看 prompt。"""
+    ds_name = f"{name}_firstframes"
+    ds = fo.load_dataset(ds_name) if fo.dataset_exists(ds_name) else fo.Dataset(ds_name, persistent=True)
+    samples = []
+    for c in clips.values():
+        png = c.get("first_frame_path")
+        if c.get("status") != "ready" or not png or not Path(png).exists():
+            continue
+        s = fo.Sample(filepath=png)
+        for k in ("caption", "num_shots", "cut_frames", "lang", "style", "motion_score", "dover_overall", "aes_mean",
+                  "kvq_score", "caption_warnings", "ff_luma", "ff_sharpness"):
+            s[k] = c.get(k)
+        s["video"] = c["filepath"]
+        samples.append(s)
+    if samples:
+        ds.merge_samples(samples, key_field="filepath", insert_new=True, overwrite=True)
+        keep = {s.filepath for s in samples}
+        stale = [x.id for x in ds.select_fields() if x.filepath not in keep]
+        if stale:
+            ds.delete_samples(stale)
+    print(f"[{time.strftime('%H:%M:%S')}] {ds_name}: {len(ds)} 个样本")
+
+
+def ensure_views(fo, name):
+    """常用筛选存成视图，App 左上角的视图下拉框里直接选。"""
+    from fiftyone import ViewField as F
+    ds = fo.load_dataset(name)
+    views = {  # 视图名只能用英文（FiftyOne 要能转成 URL），中文说明写在 description 里
+        "final": ("最终样本（已过全部步骤）", ds.match(F("status") == "ready")),
+        "final-multishot": ("最终样本里的多镜头片段", ds.match((F("status") == "ready") & (F("num_shots") >= 2))),
+        "final-dialogue-appended": ("最终样本里对白是事后补上的（没指认说话人）",
+                                    ds.match((F("status") == "ready") & F("caption_warnings").contains_str("speech_appended"))),
+        "rejected-quality": ("第 4 步画质被拒", ds.match(F("reject_step") == "quality")),
+        "rejected-caption": ("第 6 步描述不合格", ds.match(F("reject_step") == "caption")),
+        "rejected-first-frame": ("第 7 步首帧被拒（黑、糊、淡入）", ds.match(F("reject_step") == "i2v")),
+        "rejected-motion": ("第 3 步运动分被拒", ds.match(F("reject_step") == "motion")),
+    }
+    for vname, (desc, view) in views.items():
+        ds.save_view(vname, view, description=desc, overwrite=True)
 
 
 def main():
