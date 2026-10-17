@@ -132,6 +132,12 @@ def sync(fo, name, root):
             samples.append(s)
         if samples:
             ds.merge_samples(samples, key_field="filepath", insert_new=True, overwrite=True)
+            # merge_samples 会跳过值为 None 的字段，这几个状态字段单独按片段写一遍，清掉旧值
+            have = {s.filepath for s in samples}
+            for field in ("status", "stage", "reject_step", "reject_reason", "step1_reject"):
+                vals = {fp: rec.get(field) for fp, rec in records.items() if fp in have and field in rec}
+                if vals:
+                    ds.set_values(field, vals, key_field="filepath")
         print(f"[{time.strftime('%H:%M:%S')}] {ds_name}: {len(ds)} 个样本")
     sync_first_frames(fo, name, clips)
     ensure_views(fo, name)
