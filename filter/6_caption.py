@@ -43,8 +43,8 @@ CAPTION_FIELDS = ["caption", "caption_asr", "caption_words", "caption_speakers",
 
 # 指南原文改写成"描述看到和听到的"，规则和措辞尽量照抄指南，让训练描述和推理时的 prompt 同分布
 from filter.h3_caption_format import (  # noqa: E402
-    H3_RULES, CAPTION_PREFIX, FIELDS, SOFT_ISSUES, format_cut_time, parse_cut_frames,
-    check_caption, normalize_caption, describe_issue,
+    H3_RULES, CAPTION_PREFIX, FIELDS, SOFT_ISSUES, I2VA_LINE, format_cut_time, parse_cut_frames,
+    check_caption, normalize_caption, describe_issue, repair_shots, ensure_picture_ref,
 )
 
 SYSTEM_PROMPT = """You are a meticulous annotator of video clips for training MiniMax-H3, a model that generates video and audio together. Watch the clip, listen to its soundtrack, and write the caption H3 should be trained with: a faithful description of exactly what is seen and heard.
@@ -271,8 +271,9 @@ def caption_clip(captioner, path, cut_frames=(), dialogue=None):
             hint = ("Speakers (from a human transcript): " + "; ".join(f"{k} = {v}" for k, v in legend.items())
                     + ". Their lines, in order:\n" + "\n".join(f"{x['sid']}: {x['d']}" for x in dialogue)
                     + "\nWork every line into integrated_multimodal_description at the moment it is spoken, copying "
-                      "the <d> block exactly, in a natural sentence such as: The woman in the grey shirt (S2) "
-                      "says: <d>[English] I'm fine.</d>") if dialogue else \
+                      "the <d> block exactly, in a natural sentence that names the speaker by what they look like "
+                      f"on screen, such as: The {dialogue[0]['who']} ({dialogue[0]['sid']}) says: {dialogue[0]['d']}"
+                      ) if dialogue else \
                    "Nobody speaks or sings in this clip, so write no <d> block."
         else:
             transcript = transcribe(captioner, path)
@@ -281,18 +282,35 @@ def caption_clip(captioner, path, cut_frames=(), dialogue=None):
                     "with a speaker ID:\n" + "\n".join(f"<d>{line}</d>" for line in transcript)) if transcript else \
                    "No speech or singing was detected in this clip's audio, so write no <d> block."
         user_text = f"Write the caption for this {duration:.2f}-second clip. {shot_hint} {hint}"
-        caption = ""
+        prefix = CAPTION_PREFIX
+        if args.task == "i2va":
+            # 首帧图生视频：生成时首帧作为 <Picture 1> 给模型，描述先锚定首帧，再往后写
+            prefix = I2VA_LINE + "\n\n" + CAPTION_PREFIX
+            user_text += (" This is an image-to-video sample: the first frame of the clip is given to the generator as "
+                          "<Picture 1>. Begin [Shot 1] by anchoring to it, referring to the subjects and setting as shown "
+                          "in <Picture 1> (for example \"the young woman shown in <Picture 1> ...\"), keep their "
+                          "appearance, clothing, positions and the composition consistent with it, then describe what "
+                          "happens next.")
+        caption, fixes = "", []
         for attempt in range(2):  # 不合格时把问题告诉模型重写一次
             caption = normalize_caption(captioner.generate(
-                SYSTEM_PROMPT, user_text, path, with_video=True, with_audio=has_audio, prefix=CAPTION_PREFIX,
+                SYSTEM_PROMPT, user_text, path, with_video=True, with_audio=has_audio, prefix=prefix,
                 max_new_tokens=args.max_new_tokens, repetition_penalty=args.repetition_penalty,
                 temperature=0.3 * attempt))  # 重写时加一点随机性，避免和第一次一样陷进重复
-            issues, _ = check_caption(caption, has_speech=bool(transcript), cut_times=cut_times)
+            fixes = []
+            caption, changed = repair_shots(caption, cut_times)  # 切点写在正文里漏了 [Shot k]、时间略有出入
+            if changed:
+                fixes.append("shots_repaired")
+            issues, _ = check_caption(caption, has_speech=bool(transcript), cut_times=cut_times, mode=args.task)
             if not issues or attempt == 1:
                 break
             user_text += "\nYour previous attempt broke these rules, fix them: " + "; ".join(map(describe_issue, issues)) + "."
     finally:
         captioner.release(path)
+    if args.task == "i2va":
+        caption, added = ensure_picture_ref(caption)  # 正文没提 <Picture 1> 时补首帧绑定句
+        if added:
+            fixes.append("picture_ref_added")
     appended = False
     if transcript and "<d>" not in caption:
         # 重写后仍漏对白：在画面描述末尾补一句不指认说话人的对白（记 speech_appended 警告）
@@ -300,7 +318,7 @@ def caption_clip(captioner, path, cut_frames=(), dialogue=None):
         caption = re.sub(r"(integrated_multimodal_description:.*?)(\n\noverall_soundscape:)",
                          lambda m: f"{m.group(1)} A voice (S1) says: {said}{m.group(2)}", caption, count=1, flags=re.S)
         appended = True
-    return caption, transcript, cut_times, appended
+    return caption, transcript, cut_times, appended, fixes
 
 
 def clip_annotation_dialogue(item):
@@ -323,14 +341,14 @@ def process_clip(captioner, item):
         row["caption_reject_reason"] = "file_not_found"
         return row
     try:
-        caption, transcript, cut_times, appended = caption_clip(
+        caption, transcript, cut_times, appended, fixes = caption_clip(
             captioner, path, parse_cut_frames(item.get("cut_frames")), clip_annotation_dialogue(item))
     except Exception as e:
         row["caption_reject_reason"] = f"caption_failed:{type(e).__name__}:{str(e)[:200]}"
         print(f"  [失败] {path}: {e}")
         return row
-    issues, stats = check_caption(caption, has_speech=bool(transcript), cut_times=cut_times)
-    warnings = [i for i in issues if i in SOFT_ISSUES] + (["speech_appended"] if appended else [])
+    issues, stats = check_caption(caption, has_speech=bool(transcript), cut_times=cut_times, mode=args.task)
+    warnings = [i for i in issues if i in SOFT_ISSUES] + (["speech_appended"] if appended else []) + fixes
     issues = [i for i in issues if i not in SOFT_ISSUES]
     row["caption_warnings"] = ",".join(warnings)
     row["caption"] = caption
@@ -414,6 +432,8 @@ parser.add_argument("--max_long_side", type=int, default=768, help="送给模型
 parser.add_argument("--max_new_tokens", type=int, default=1024)
 parser.add_argument("--repetition_penalty", type=float, default=1.05)
 parser.add_argument("--attn_implementation", default="flash_attention_2", choices=["flash_attention_2", "sdpa"])
+parser.add_argument("--task", default="t2va", choices=["t2va", "i2va"],
+                    help="i2va：首帧图生视频，描述第一行是官方 I2VA 对齐说明，正文先锚定首帧 <Picture 1>")
 parser.add_argument("--backend", default="transformers", choices=["transformers", "vllm"],
                     help="vllm：连 script/serve_omni.sh 起的服务，--workers 路并发；transformers：进程内单路")
 parser.add_argument("--server_url", default="http://127.0.0.1:8901")

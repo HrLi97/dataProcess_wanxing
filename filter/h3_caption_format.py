@@ -75,11 +75,16 @@ def _count_sentences(text):
     return len([s for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]) if text else 0
 
 
+# I2VA（首帧图生视频）描述的固定第一行，后面空一行再接三个字段（官方指南 base-en.txt §2.1）
+I2VA_LINE = "For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced."
+_ALIGNMENT_START = re.compile(r"^\s*(For the target video|How the reference pictures align)")
+
+
 _MOOD_WORDS = re.compile(
     r"\b(?:melanchol\w*|somber|sombre|mysterious|serene|contemplative|reflective|calm(?:ing)?|peaceful|tranquil|"
     r"uplifting|tense|suspenseful|emotional|joyful|sad|happy|hopeful|nostalgic|romantic|eerie|ominous|mood|"
     r"atmosphere|atmospheric|feeling)\b", re.I)
-SOFT_ISSUES = ("music_mood_words",)  # 只警告不拒：重写一次仍有则保留描述，记进 caption_warnings
+SOFT_ISSUES = ("music_mood_words", "picture_ref_missing")  # 只警告不拒：重写一次仍有则保留描述，记进 caption_warnings
 
 # 重写时告诉模型的问题说明（检查项代号模型看不懂）
 ISSUE_HINTS = {
@@ -90,6 +95,9 @@ ISSUE_HINTS = {
     "dialogue_outside_description": "dialogue belongs inside integrated_multimodal_description, "
                                     "not in overall_soundscape or non_diegetic_music",
     "multi_shot": "the clip is a single shot, so write only [Shot 1]",
+    "i2va_line": "the first line must be exactly: " + I2VA_LINE + " followed by one blank line",
+    "alignment_unexpected": "do not start with an image-alignment line; begin directly with integrated_multimodal_description",
+    "picture_ref_missing": "[Shot 1] must anchor to the first frame, referring to it as <Picture 1>",
     "shot_count": "write exactly one [Shot k] section per shot, as many as the cuts given above plus one",
     "cut_time_mismatch": "begin each later shot with exactly the cut times given above, like [Shot 2] At 00:02.375,",
     "second_count": "do not mention the clip length or count seconds",
@@ -106,10 +114,17 @@ def describe_issue(code):
     return ISSUE_HINTS.get(code) or ISSUE_HINTS.get(re.split(r"[_:]", code)[0], code.replace("_", " "))
 
 
-def check_caption(text, has_speech=True, cut_times=None):
+def check_caption(text, has_speech=True, cut_times=None, mode="t2va"):
     """按 verifyH3Prompt.ts 的格式规则（error 级）检查，另加单镜头、描述须为英文、没人声不许有对白三条。
+    mode="i2va" 时第一行必须是 I2VA_LINE、后面空一行；描述里没提 <Picture 1> 记软警告 picture_ref_missing。
     返回 (问题列表, 统计)。"""
     issues = []
+    lines = text.split("\n")
+    if mode == "i2va":
+        if lines[0].strip() != I2VA_LINE or (len(lines) > 1 and lines[1].strip()):
+            issues.append("i2va_line")
+    elif _ALIGNMENT_START.match(lines[0]):
+        issues.append("alignment_unexpected")
     at = [m.start() if (m := re.search(rf"^\s*{f}\s*:", text, re.M)) else -1 for f in FIELDS]
     for f, i in zip(FIELDS, at):
         if i < 0:
@@ -170,6 +185,8 @@ def check_caption(text, has_speech=True, cut_times=None):
             issues.append("voiceover_no_lips")
 
     # 对白和画面文字之外都应是英文
+    if mode == "i2va" and "<Picture 1>" not in imd:
+        issues.append("picture_ref_missing")
     outside = re.sub(r'<d>.*?</d>|"[^"]*"|“[^”]*”', "", text, flags=re.S)
     if _CJK.search(outside):
         issues.append("non_english_description")
@@ -189,7 +206,8 @@ _PROMPT_HEADINGS = re.compile(r"^\s*(?:speech and singing|visible text)\s*:?\s*$
 
 
 def normalize_caption(text):
-    """去掉代码块标记和模型抄来的系统提示小标题；每个字段合成一段，字段之间统一一个空行。"""
+    """去掉代码块标记和模型抄来的系统提示小标题；每个字段合成一段，字段之间统一一个空行。
+    开头的对齐说明行（I2VA 等）原样保留在最前面。"""
     text = re.sub(r"^```\w*\s*|\s*```$", "", text.strip())
     text = _PROMPT_HEADINGS.sub("", text)
     for i, f in enumerate(FIELDS):  # 字段名大小写不对、或后两个字段没换行（"… Overall_soundscape: …"）时改回来
@@ -199,6 +217,7 @@ def normalize_caption(text):
     parts = re.split(rf"^\s*({'|'.join(FIELDS)})\s*:", text, flags=re.M)
     if len(parts) < 3:
         return text.strip()
+    preamble = parts[0].strip()
     fields = {name: " ".join(body.split()) for name, body in zip(parts[1::2], parts[2::2])}
     # 模型偶尔把对白句写到环境声 / 配乐字段后面（"N/A The woman (S1) says: <d>…</d>"）：挪回描述末尾
     for name in FIELDS[1:]:
@@ -206,7 +225,8 @@ def normalize_caption(text):
             sents = _split_sentences(fields[name])
             fields[FIELDS[0]] += " " + " ".join(x for x in sents if "<d>" in x)
             fields[name] = " ".join(x for x in sents if "<d>" not in x) or "N/A"
-    return "\n\n".join(f"{name}: {body}" for name, body in fields.items())
+    body = "\n\n".join(f"{name}: {b}" for name, b in fields.items())
+    return f"{preamble}\n\n{body}" if _ALIGNMENT_START.match(preamble) else body
 
 
 def _split_sentences(text):
@@ -225,3 +245,73 @@ def _split_sentences(text):
     return [re.sub(r"\x00(\d+)\x00", lambda m: blocks[int(m.group(1))], x) for x in sents]
 
 
+# ─── 生成后的确定性修补 ──────────────────────────────────────────────────────
+_TIME = r"\d{1,3}:\d{2}(?:\.\d+)?"
+
+
+def _secs(t):
+    m, s = t.split(":")
+    return int(m) * 60 + float(s)
+
+
+def repair_shots(text, cut_times, tol=0.15):
+    """按已知切点修补镜头标记，返回 (新文本, 是否改动)。
+
+    模型常见的两种写法：① 切点写在正文里（"At 00:00.709, the camera cuts to…"）但漏了 [Shot k]；
+    ② 写了 [Shot k] 但没写时间或时间格式 / 数值略有出入。切点是 Step 2 检测出来的，所以按它补齐。
+    """
+    if not cut_times:
+        return text, False
+    m = re.search(r"integrated_multimodal_description:(.*?)(?=\n\noverall_soundscape:|\Z)", text, re.S)
+    if not m:
+        return text, False
+    imd, n = m.group(1), len(cut_times) + 1
+    if [t for _, t in re.findall(r"\[Shot (\d+)\] At (\d{2}:\d{2}\.\d{3})", imd)] == list(cut_times):
+        return text, False  # 切点已经全写对（正文里别处再提到 [Shot k] 也不动）
+    shots = sorted({int(k) for k in re.findall(r"\[Shot (\d+)\]", imd)})
+    new = imd
+    if shots == list(range(1, n + 1)):
+        for k, t in enumerate(cut_times, 2):
+            def fix(mm, t=t, k=k):
+                rest = mm.group(2).lstrip(" ,")
+                if not re.match(r"(the camera|the shot)\b", rest, re.I):
+                    rest = rest[:1].lower() + rest[1:]
+                return f"[Shot {k}] At {t}, {rest}"
+            new = re.sub(rf"\[Shot {k}\]\s*(?:,?\s*[Aa]t\s+{_TIME}\s*,?)?(\s*)(.)", lambda mm: fix(mm), new, count=1)
+            new = re.sub(rf"\[Shot {k}\] At {re.escape(t)}, (\s*)", f"[Shot {k}] At {t}, ", new, count=1)
+    elif shots == [1]:
+        pos, out, ok = 0, [], True
+        for k, t in enumerate(cut_times, 2):
+            hit = None
+            for mm in re.finditer(rf"\b[Aa]t ({_TIME})\b", new[pos:]):
+                if abs(_secs(mm.group(1)) - _secs(t)) <= tol:
+                    hit = mm
+                    break
+            if hit is None:
+                ok = False
+                break
+            a = pos + hit.start()
+            out.append(new[:a] if not out else new[pos:a])
+            out.append(f"[Shot {k}] At {t}")
+            pos = pos + hit.end()
+        if not ok:
+            return text, False
+        new = "".join(out) + new[pos:]
+    else:
+        return text, False
+    if new == imd:
+        return text, False
+    return text[:m.start(1)] + new + text[m.end(1):], True
+
+
+PICTURE_BINDING = ("The scene opens exactly as shown in <Picture 1>, and every person and object keeps the same "
+                   "appearance and clothing throughout; nothing is added or removed.")
+
+
+def ensure_picture_ref(text):
+    """I2VA 描述正文没提 <Picture 1> 时，在 [Shot 1] 第一句后补一句首帧绑定句（团队 H3 prompt 手册 §2.7 的做法）。
+    返回 (新文本, 是否补了)。"""
+    m = re.search(r"(integrated_multimodal_description: \[Shot 1\] .*?[.!?])(\s)", text, re.S)
+    if not m or "<Picture 1>" in text.split("integrated_multimodal_description:", 1)[-1]:
+        return text, False
+    return text[:m.end(1)] + " " + PICTURE_BINDING + text[m.end(1):], True
